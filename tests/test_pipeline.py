@@ -57,7 +57,7 @@ def test_feature_engineering_is_deterministic():
 
     assert first == second
     assert first[0]["age"] == 65
-    assert first[0]["primary_diag"] == "4"
+    assert first[0]["primary_diag"] == "group_4"
     assert first[0]["had_previous_inpatient"] == 0
     assert first[0]["num_med"] >= 1
     assert first[0]["med_change"] == 0
