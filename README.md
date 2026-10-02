@@ -1,28 +1,195 @@
-# Patient Readmission & Risk Predictive Modeling
+# Patient Readmission Risk Modeling
 
-![Python](https://img.shields.io/badge/Python-3.8%2B-blue)
-![Scikit-Learn](https://img.shields.io/badge/Scikit--Learn-Machine_Learning-orange)
-![XGBoost](https://img.shields.io/badge/XGBoost-Gradient_Boosting-green)
-![Pandas](https://img.shields.io/badge/Pandas-Data_Analysis-yellow)
+An end-to-end machine-learning project for predicting whether a diabetic patient will be **readmitted within 30 days** using hospital encounter data.
 
-This repository contains an end-to-end Machine Learning pipeline designed to predict diabetic patient hospital readmissions using Electronic Health Records (EHR). The project demonstrates the ability to process complex, semi-structured patient-level datasets and apply advanced predictive modeling techniques to optimize healthcare resource allocation.
+The project covers data preparation, feature engineering, classification, model evaluation, and a FastAPI inference service.
 
-## Business Impact
-Hospital readmissions are a major metric for healthcare quality and cost. Accurately predicting high-risk patients allows healthcare providers to implement proactive interventions, improving patient outcomes and avoiding regulatory penalties. This model serves as a decision-support tool for clinical teams.
+## Important modeling definition
 
-## Technical Approach
-* **Exploratory Data Analysis (EDA):** Analyzed patient demographics, hospital stay durations, lab results, and medication history to identify key readmission indicators.
-* **Data Preprocessing & Feature Engineering:** Handled high-dimensionality categorical data and missing values. Addressed extreme class imbalance in the medical dataset using **SMOTE** (Synthetic Minority Over-sampling Technique).
-* **Predictive Modeling:** Developed and evaluated multiple classification algorithms including **Logistic Regression, Decision Trees, Random Forest, and XGBoost**.
-* **Model Validation:** Ensured model robustness and statistical reliability using **10-fold cross-validation**.
-* **Results:** The optimized **XGBoost** model achieved the highest performance with **93.5% accuracy** and **0.92 AUC**, effectively identifying high-risk patients.
+The target is:
 
-## Repository Structure
-* `notebooks/`: Contains Jupyter notebooks for EDA (`eda.ipynb`), baseline modeling (`logistic_regression.ipynb`), and advanced ensemble modeling (`random_forest_xgboost.ipynb`).
-* `src/`: Core Python scripts for modularized training (`train.py`) and inference (`predict.py`).
-* `model/`: Serialized models and scalers.
-* `visuals/` & `output_images/`: Analytical plots and performance metrics (ROC curves, confusion matrices).
-* `Dockerfile`: Containerization setup for deploying the prediction API.
+- `1`: `readmitted == "<30"` — readmitted within 30 days
+- `0`: `readmitted == ">30"` or `"NO"`
 
-## Getting Started
-Detailed instructions for setting up the environment using `pyproject.toml` / `uv` or standard pip requirements.
+The prediction target is intentionally narrower than "any future readmission."
+
+## Production pipeline
+
+The production training path is implemented in `src/train.py` and uses:
+
+1. Load the raw encounter data.
+2. Create the binary readmission target.
+3. Split data at the **patient level**, not the encounter-row level.
+4. Keep train, validation, and test patients disjoint.
+5. Apply the same deterministic preprocessing and feature engineering through `src/preprocessing.py`.
+6. One-hot encode categorical features with `DictVectorizer`.
+7. Train a class-balanced Random Forest.
+8. Select the classification threshold using **validation data only**, optimizing F1.
+9. Refit the selected model on train + validation data.
+10. Evaluate once on the untouched test set.
+11. Save the complete preprocessing + model pipeline and selected threshold to `model/model.bin`.
+
+### Why the patient-level split matters
+
+The source data contains multiple hospital encounters for the same patient. If encounters from one patient appear in both training and test sets, the model can learn patient-specific patterns from the training encounters and receive an unrealistically favorable test evaluation.
+
+The production split therefore uses `patient_nbr` only for grouping. It is removed before modeling and is never used as a predictive feature.
+
+### Why threshold tuning matters
+
+A probability of 0.5 is not automatically the correct decision threshold for an imbalanced medical classification problem.
+
+The model produces:
+
+```
+P(readmitted within 30 days | patient data)
+```
+
+The validation set is used to choose a threshold for converting that probability into a binary alert. The test set is not used to choose the threshold.
+
+The API returns both the probability and the threshold used for the decision.
+
+## Feature engineering
+
+The shared transformer in `src/preprocessing.py` creates deterministic features including:
+
+- `total_previous_visits`
+- `had_previous_inpatient`
+- `avg_medications_per_day`
+- `procedure_to_lab_ratio`
+- `num_medications_used`
+- `num_adjusted_medications`
+- `any_medication_change`
+- `on_insulin`
+
+It also normalizes categorical values, maps age ranges to their midpoint, handles missing values, and ensures missing API fields have the same semantics as missing training fields.
+
+Most importantly, **the same transformer is serialized inside the production model pipeline**, so training and inference do not use separate preprocessing implementations.
+
+## Class imbalance
+
+The positive class (readmission within 30 days) is substantially smaller than the negative class. The production Random Forest therefore uses:
+
+```python
+class_weight="balanced"
+```
+
+This increases the relative penalty for misclassifying minority-class examples without synthetically creating new patient records.
+
+The current production pipeline does **not** claim to use SMOTE.
+
+## Evaluation
+
+The final evaluation reports:
+
+- Accuracy
+- Precision
+- Recall
+- F1
+- ROC-AUC
+- Confusion matrix
+- Positive prediction rate
+
+The metrics are generated by the training script and written to:
+
+```
+model/metrics.json
+```
+
+No fixed performance number is advertised here because the corrected patient-level split changes the evaluation compared with the earlier encounter-level experiments.
+
+## Repository structure
+
+```
+data/
+    diabetic_data.csv
+
+notebooks/
+    eda.ipynb
+    logistic_regression.ipynb
+    random_forest_xgboost.ipynb
+
+src/
+    preprocessing.py
+    train.py
+    predict.py
+
+model/
+    model.bin
+    metrics.json
+
+Dockerfile
+pyproject.toml
+uv.lock
+```
+
+The notebooks contain exploratory/model-comparison work. The reproducible production training and deployment path is in `src/`.
+
+## Train the production model
+
+From the repository root:
+
+```bash
+uv sync
+uv run python -m src.train
+```
+
+This creates/updates:
+
+- `model/model.bin`
+- `model/metrics.json`
+
+The current committed model artifact was created by the earlier implementation and should be **regenerated with the corrected training script before deployment**.
+
+## Run the API
+
+After training:
+
+```bash
+uv run uvicorn src.predict:app --host 0.0.0.0 --port 9696
+```
+
+Then send a POST request to:
+
+```
+/predict
+```
+
+The response contains:
+
+```json
+{
+  "readmitted_probability": 0.23,
+  "readmitted": true,
+  "decision_threshold": 0.15
+}
+```
+
+The numbers above are only an example of the response format; they are not reported model performance.
+
+## Docker
+
+Build and run:
+
+```bash
+docker build -t patient-readmission-risk .
+docker run -p 9696:9696 patient-readmission-risk
+```
+
+The Docker image expects the regenerated `model/model.bin`.
+
+## Reproducibility and rollback
+
+Before the production-pipeline changes, the repository was preserved on the branch:
+
+```
+backup/baseline-2026-10-02
+```
+
+The corrected work is being developed on:
+
+```
+fix/robust-readmission-pipeline
+```
+
+This makes it possible to compare the corrected implementation against the exact previous repository state.
