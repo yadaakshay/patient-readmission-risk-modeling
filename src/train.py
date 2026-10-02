@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Leakage-safe model comparison and production training."""
+"""Leakage-safe training and model comparison for hospital readmission."""
 
 from __future__ import annotations
 
@@ -22,14 +22,11 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import (
-    GroupShuffleSplit,
-    StratifiedGroupKFold,
-    cross_validate,
-)
+from sklearn.model_selection import GridSearchCV, StratifiedGroupKFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeClassifier
 from xgboost import XGBClassifier
+from sklearn.base import clone
 
 from src.preprocessing import ReadmissionFeatureEngineer
 
@@ -46,9 +43,7 @@ def load_raw_data() -> pd.DataFrame:
     return pd.read_csv(DATA_PATH)
 
 
-def prepare_target(
-    df: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.Series]:
+def prepare_target(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     if "readmitted" not in df.columns:
         raise ValueError("Expected 'readmitted' target column.")
 
@@ -59,35 +54,45 @@ def prepare_target(
 def patient_level_split(
     X: pd.DataFrame,
     y: pd.Series,
-):
-    """Create patient-disjoint 60/20/20 train/validation/test sets."""
+) -> tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.Series,
+    pd.Series,
+    pd.Series,
+]:
+    """Create approximately 60/20/20 patient-disjoint splits."""
 
     if "patient_nbr" not in X.columns:
         raise ValueError("patient_nbr is required for grouped splitting.")
 
     groups = X["patient_nbr"]
 
-    outer = GroupShuffleSplit(
-        n_splits=1,
-        test_size=0.20,
+    # Five stratified groups gives an approximately 20% patient-level test set.
+    outer_cv = StratifiedGroupKFold(
+        n_splits=5,
+        shuffle=True,
         random_state=RANDOM_STATE,
     )
     train_val_idx, test_idx = next(
-        outer.split(X, y, groups=groups)
+        outer_cv.split(X, y, groups=groups)
     )
 
     X_train_val = X.iloc[train_val_idx].copy()
     y_train_val = y.iloc[train_val_idx].copy()
 
-    inner = GroupShuffleSplit(
-        n_splits=1,
-        test_size=0.25,
+    # Four groups on the remaining 80% gives an approximately 20% validation
+    # set overall.
+    inner_cv = StratifiedGroupKFold(
+        n_splits=4,
+        shuffle=True,
         random_state=RANDOM_STATE,
     )
     inner_groups = X_train_val["patient_nbr"]
 
     train_idx, val_idx = next(
-        inner.split(
+        inner_cv.split(
             X_train_val,
             y_train_val,
             groups=inner_groups,
@@ -120,167 +125,187 @@ def patient_level_split(
     )
 
 
-def _base_steps() -> list[tuple[str, object]]:
-    """Common preprocessing and fold-local SMOTE."""
-
-    return [
+def _base_steps(*, scale: bool) -> list[tuple[str, object]]:
+    steps: list[tuple[str, object]] = [
         ("features", ReadmissionFeatureEngineer()),
         ("vectorizer", DictVectorizer()),
+    ]
+
+    if scale:
+        # Sparse-safe standardization for logistic regression. Tree models do
+        # not need feature scaling.
+        steps.append(
+            ("scaler", StandardScaler(with_mean=False))
+        )
+
+    steps.append(
         (
             "smote",
             SMOTE(
                 random_state=RANDOM_STATE,
                 k_neighbors=5,
             ),
-        ),
-    ]
+        )
+    )
+
+    return steps
 
 
-def build_model_pipelines() -> dict[str, Pipeline]:
-    """
-    Candidate model families from the original notebook.
+def build_model_searches() -> dict[str, tuple[Pipeline, dict]]:
+    """Return notebook-inspired model families and small tuning grids."""
 
-    SMOTE is inside every pipeline, so cross-validation generates synthetic
-    observations only from each fold's training portion.
-    """
+    searches: dict[str, tuple[Pipeline, dict]] = {}
 
-    return {
-        "logistic_regression": Pipeline(
-            steps=[
-                *_base_steps(),
-                ("scaler", StandardScaler(with_mean=False)),
+    searches["logistic_regression"] = (
+        Pipeline(
+            steps=_base_steps(scale=True)
+            + [
                 (
                     "model",
                     LogisticRegression(
-                        penalty="l1",
+                        penalty="l2",
                         solver="liblinear",
-                        C=1.0,
-                        max_iter=2000,
+                        max_iter=1000,
                         random_state=RANDOM_STATE,
                     ),
-                ),
+                )
             ]
         ),
-        "decision_tree": Pipeline(
-            steps=[
-                *_base_steps(),
+        {
+            "model__C": [0.1, 1.0],
+        },
+    )
+
+    searches["decision_tree"] = (
+        Pipeline(
+            steps=_base_steps(scale=False)
+            + [
                 (
                     "model",
                     DecisionTreeClassifier(
-                        max_depth=28,
-                        min_samples_split=10,
-                        criterion="gini",
                         random_state=RANDOM_STATE,
                     ),
-                ),
+                )
             ]
         ),
-        "random_forest": Pipeline(
-            steps=[
-                *_base_steps(),
+        {
+            "model__criterion": ["gini", "entropy"],
+            "model__max_depth": [15, 25],
+            "model__min_samples_leaf": [5],
+        },
+    )
+
+    searches["random_forest"] = (
+        Pipeline(
+            steps=_base_steps(scale=False)
+            + [
                 (
                     "model",
                     RandomForestClassifier(
                         n_estimators=200,
-                        max_depth=25,
-                        min_samples_split=10,
-                        criterion="gini",
                         max_features="sqrt",
                         n_jobs=1,
                         random_state=RANDOM_STATE,
                     ),
-                ),
+                )
             ]
         ),
-        "xgboost": Pipeline(
-            steps=[
-                *_base_steps(),
+        {
+            "model__max_depth": [15, 25],
+            "model__min_samples_leaf": [3],
+        },
+    )
+
+    searches["xgboost"] = (
+        Pipeline(
+            steps=_base_steps(scale=False)
+            + [
                 (
                     "model",
                     XGBClassifier(
-                        n_estimators=500,
-                        max_depth=8,
-                        learning_rate=0.05,
-                        colsample_bytree=0.9,
-                        subsample=0.8,
                         objective="binary:logistic",
                         eval_metric="logloss",
-                        tree_method="hist",
+                        n_estimators=300,
+                        learning_rate=0.05,
+                        subsample=0.8,
+                        colsample_bytree=0.8,
                         n_jobs=1,
                         random_state=RANDOM_STATE,
                     ),
-                ),
+                )
             ]
         ),
-    }
+        {
+            "model__max_depth": [4, 6],
+        },
+    )
+
+    return searches
 
 
-def evaluate_models(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-) -> tuple[dict[str, Pipeline], dict[str, dict]]:
-    """Compare models using patient-grouped 10-fold CV."""
-
-    cv = StratifiedGroupKFold(
+def build_cv() -> StratifiedGroupKFold:
+    return StratifiedGroupKFold(
         n_splits=CV_FOLDS,
         shuffle=True,
         random_state=RANDOM_STATE,
     )
 
-    scoring = {
-        "roc_auc": "roc_auc",
-        "accuracy": "accuracy",
-        "precision": "precision",
-        "recall": "recall",
-        "f1": "f1",
-    }
 
-    pipelines = build_model_pipelines()
-    results: dict[str, dict] = {}
+def tune_models(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+) -> tuple[str, Pipeline, dict, dict]:
+    """Compare the notebook's model families using leakage-safe grouped CV."""
 
-    records = X_train.to_dict(orient="records")
-    groups = X_train["patient_nbr"].to_numpy()
-    y_array = y_train.to_numpy()
+    results: dict = {}
+    best_name = ""
+    best_score = -np.inf
+    best_estimator = None
+    best_params = None
 
-    for name, pipeline in pipelines.items():
-        print(f"\nCross-validating {name}...")
+    for name, (pipeline, param_grid) in build_model_searches().items():
+        print(f"\n===== {name} =====")
 
-        scores = cross_validate(
-            pipeline,
-            records,
-            y_array,
-            groups=groups,
-            cv=cv,
-            scoring=scoring,
+        search = GridSearchCV(
+            estimator=pipeline,
+            param_grid=param_grid,
+            scoring="roc_auc",
+            cv=build_cv(),
             n_jobs=-1,
+            refit=True,
             return_train_score=False,
         )
 
-        results[name] = {
-            metric: {
-                "mean": float(np.mean(scores[f"test_{metric}"])),
-                "std": float(np.std(scores[f"test_{metric}"])),
-            }
-            for metric in scoring
-        }
-
-        print(
-            f"{name}: "
-            f"ROC-AUC={results[name]['roc_auc']['mean']:.4f} "
-            f"+/- {results[name]['roc_auc']['std']:.4f}"
+        search.fit(
+            X_train.to_dict(orient="records"),
+            y_train.to_numpy(),
+            groups=X_train["patient_nbr"].to_numpy(),
         )
 
-    return pipelines, results
+        score = float(search.best_score_)
 
+        results[name] = {
+            "cv_roc_auc": score,
+            "best_params": search.best_params_,
+        }
 
-def choose_model(
-    cv_results: dict[str, dict],
-) -> str:
-    """Select the candidate with the highest mean CV ROC-AUC."""
+        print(f"Best CV ROC-AUC: {score:.4f}")
+        print(f"Best parameters: {search.best_params_}")
 
-    return max(
-        cv_results,
-        key=lambda name: cv_results[name]["roc_auc"]["mean"],
+        if score > best_score:
+            best_score = score
+            best_name = name
+            best_estimator = search.best_estimator_
+            best_params = search.best_params_
+
+    assert best_estimator is not None
+    assert best_params is not None
+
+    return (
+        best_name,
+        best_estimator,
+        best_params,
+        results,
     )
 
 
@@ -288,16 +313,13 @@ def choose_threshold(
     y_true: pd.Series,
     probabilities: np.ndarray,
 ) -> float:
-    """Select threshold using validation data only."""
+    """Choose threshold on validation data only."""
 
     best_threshold = 0.50
     best_f1 = -1.0
 
     for threshold in np.arange(0.05, 0.51, 0.01):
-        predictions = (
-            probabilities >= threshold
-        ).astype(int)
-
+        predictions = (probabilities >= threshold).astype(int)
         score = f1_score(
             y_true,
             predictions,
@@ -316,9 +338,7 @@ def evaluate(
     probabilities: np.ndarray,
     threshold: float,
 ) -> dict:
-    predictions = (
-        probabilities >= threshold
-    ).astype(int)
+    predictions = (probabilities >= threshold).astype(int)
 
     return {
         "threshold": threshold,
@@ -353,7 +373,9 @@ def evaluate(
             y_true,
             predictions,
         ).tolist(),
-        "positive_rate": float(np.mean(predictions)),
+        "positive_rate": float(
+            np.mean(predictions)
+        ),
     }
 
 
@@ -371,34 +393,29 @@ def main() -> None:
     ) = patient_level_split(X, y)
 
     print(
-        "Patient-disjoint split:",
+        "Split sizes:",
         f"train={len(X_train)}",
         f"val={len(X_val)}",
         f"test={len(X_test)}",
     )
-
-    # CV happens only on training patients.
-    pipelines, cv_results = evaluate_models(
-        X_train,
-        y_train,
-    )
-
-    selected_model_name = choose_model(cv_results)
-
     print(
-        f"\nSelected model by CV ROC-AUC: "
-        f"{selected_model_name}"
+        "Positive rates:",
+        f"train={y_train.mean():.4f}",
+        f"val={y_val.mean():.4f}",
+        f"test={y_test.mean():.4f}",
     )
 
-    # Fit selected model on training patients only.
-    selected_pipeline = pipelines[selected_model_name]
-    selected_pipeline.fit(
-        X_train.to_dict(orient="records"),
-        y_train.to_numpy(),
-    )
+    # Model selection happens only inside the training patients.
+    (
+        best_name,
+        best_cv_estimator,
+        best_params,
+        cv_results,
+    ) = tune_models(X_train, y_train)
 
-    # Validation is used only for threshold selection.
-    val_probabilities = selected_pipeline.predict_proba(
+    # The CV-refit estimator has only seen training patients. Use the separate
+    # validation patients solely to choose the probability threshold.
+    val_probabilities = best_cv_estimator.predict_proba(
         X_val.to_dict(orient="records")
     )[:, 1]
 
@@ -408,10 +425,16 @@ def main() -> None:
     )
 
     print(
-        f"Selected validation threshold: {threshold:.2f}"
+        f"\nSelected model: {best_name}"
+    )
+    print(
+        f"Validation threshold: {threshold:.2f}"
     )
 
-    # Refit only after model and threshold decisions are complete.
+    # Refit a fresh copy on train + validation only, after every modeling
+    # decision has been made.
+    final_pipeline = clone(best_cv_estimator)
+
     X_train_final = pd.concat(
         [X_train, X_val],
         axis=0,
@@ -421,16 +444,15 @@ def main() -> None:
         axis=0,
     )
 
-    final_pipeline = build_model_pipelines()[
-        selected_model_name
-    ]
-
     final_pipeline.fit(
-        X_train_final.to_dict(orient="records"),
+        X_train_final.to_dict(
+            orient="records"
+        ),
         y_train_final.to_numpy(),
     )
 
-    # The test set is touched exactly once.
+    # The test patients have not been used for model selection, threshold
+    # selection, or hyperparameter tuning.
     test_probabilities = final_pipeline.predict_proba(
         X_test.to_dict(orient="records")
     )[:, 1]
@@ -451,27 +473,22 @@ def main() -> None:
             {
                 "pipeline": final_pipeline,
                 "threshold": threshold,
-                "model_name": selected_model_name,
-                "target_definition": (
-                    "readmitted_within_30_days"
-                ),
+                "model_name": best_name,
+                "target_definition": "readmitted_within_30_days",
             },
             f_out,
         )
 
     metrics = {
         "methodology": {
-            "target": "readmitted == '<30'",
-            "outer_split": "patient-level 60/20/20",
+            "target": "<30 vs >30/NO",
+            "outer_split": "patient-disjoint stratified group split",
             "cv": "10-fold StratifiedGroupKFold",
-            "group_column": "patient_nbr",
-            "smote_inside_pipeline": True,
-            "test_set_used_for_tuning": False,
-            "test_set_used_for_threshold_selection": False,
-            "auc_uses_probabilities": True,
+            "smote": "inside each CV training fold only",
+            "model_selection_metric": "roc_auc",
+            "threshold_metric": "f1 on validation set",
+            "final_test": "untouched until final evaluation",
         },
-        "selected_model": selected_model_name,
-        "cv_results": cv_results,
         "split": {
             "train_rows": len(X_train),
             "validation_rows": len(X_val),
@@ -486,6 +503,11 @@ def main() -> None:
                 X_test["patient_nbr"].nunique()
             ),
         },
+        "model_comparison": cv_results,
+        "selected_model": best_name,
+        "selected_model_cv_roc_auc": cv_results[
+            best_name
+        ]["cv_roc_auc"],
         "validation_threshold": threshold,
         "test": test_metrics,
     }
@@ -502,7 +524,7 @@ def main() -> None:
 
     print("\nFinal untouched-test metrics:")
     print(json.dumps(test_metrics, indent=2))
-    print(f"Saved model to {MODEL_PATH}")
+    print(f"\nSaved model to {MODEL_PATH}")
     print(f"Saved metrics to {METRICS_PATH}")
 
 
