@@ -1,186 +1,234 @@
 #!/usr/bin/env python
-# coding: utf-8
+"""Train the production readmission model with patient-level evaluation."""
 
-# To save our model, we use pickle, a system import
+from __future__ import annotations
+
+import json
 import pickle
+from pathlib import Path
 
-import pandas as pd
 import numpy as np
-import sklearn
-
-from sklearn.pipeline import make_pipeline # What does this do
-from sklearn.feature_extraction import DictVectorizer
+import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_extraction import DictVectorizer
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from sklearn.model_selection import GroupShuffleSplit
+from sklearn.pipeline import Pipeline
 
-print(f'pandas=={pd.__version__}')
-print(f'numpy=={np.__version__}')
-print(f'sklearn=={sklearn.__version__}')
+from preprocessing import ReadmissionFeatureEngineer
 
-# Feature engineering function
-def engineer_features(df):
-    # Create additional predictive features while preserving the original columns.
 
-    # -------- Visit history / intensity features --------
-    df['total_previous_visits'] = (
-        df['number_outpatient'] + df['number_emergency'] + df['number_inpatient']
+DATA_PATH = Path("data/diabetic_data.csv")
+MODEL_PATH = Path("model/model.bin")
+METRICS_PATH = Path("model/metrics.json")
+RANDOM_STATE = 42
+
+
+def load_raw_data() -> pd.DataFrame:
+    """Load the raw encounter data without fitting any preprocessing on it."""
+    return pd.read_csv(DATA_PATH)
+
+
+def prepare_target(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+    if "readmitted" not in df.columns:
+        raise ValueError("Expected 'readmitted' target column.")
+
+    # <30 is the positive class: readmitted within 30 days.
+    y = (df["readmitted"] == "<30").astype(int)
+
+    # patient_nbr is retained temporarily for grouped splitting and is removed
+    # from the model features by ReadmissionFeatureEngineer.
+    return df.drop(columns=["readmitted"]), y
+
+
+def patient_level_split(
+    X: pd.DataFrame, y: pd.Series
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, pd.Series]:
+    """Create 60/20/20 train/validation/test splits with no patient overlap."""
+
+    if "patient_nbr" not in X.columns:
+        raise ValueError("patient_nbr is required for patient-level splitting.")
+
+    groups = X["patient_nbr"]
+
+    outer = GroupShuffleSplit(
+        n_splits=1, test_size=0.20, random_state=RANDOM_STATE
+    )
+    train_val_idx, test_idx = next(outer.split(X, y, groups=groups))
+
+    X_train_val = X.iloc[train_val_idx].copy()
+    y_train_val = y.iloc[train_val_idx].copy()
+
+    inner = GroupShuffleSplit(
+        n_splits=1, test_size=0.25, random_state=RANDOM_STATE
+    )
+    inner_groups = X_train_val["patient_nbr"]
+    train_idx, val_idx = next(
+        inner.split(X_train_val, y_train_val, groups=inner_groups)
     )
 
-    df['had_previous_inpatient'] = (df['number_inpatient'] > 0).astype(int)
+    X_train = X_train_val.iloc[train_idx].copy()
+    X_val = X_train_val.iloc[val_idx].copy()
+    X_test = X.iloc[test_idx].copy()
 
-    # Avoid division by zero by adding +1 to the denominator
-    df['avg_medications_per_day'] = df['num_medications'] / (df['time_in_hospital'] + 1)
-    df['procedure_to_lab_ratio'] = df['num_procedures'] / (df['num_lab_procedures'] + 1)
+    y_train = y_train_val.iloc[train_idx].copy()
+    y_val = y_train_val.iloc[val_idx].copy()
+    y_test = y.iloc[test_idx].copy()
 
-    # -------- Medication change summaries --------
-    med_cols = [
-        'metformin','repaglinide','nateglinide','chlorpropamide','glimepiride',
-        'acetohexamide','glipizide','glyburide','tolbutamide','pioglitazone',
-        'rosiglitazone','acarbose','miglitol','troglitazone','tolazamide',
-        'examide','citoglipton','insulin'
-    ]
+    train_patients = set(X_train["patient_nbr"])
+    val_patients = set(X_val["patient_nbr"])
+    test_patients = set(X_test["patient_nbr"])
 
-    # Count how many meds are used at all (value != 'no')
-    df['num_medications_used'] = df[med_cols].apply(lambda row: (row != 'no').sum(), axis=1)
+    assert train_patients.isdisjoint(val_patients)
+    assert train_patients.isdisjoint(test_patients)
+    assert val_patients.isdisjoint(test_patients)
 
-    # Count meds with dose adjustment (value in {'up','down'})
-    df['num_adjusted_medications'] = df[med_cols].apply(lambda row: row.isin(['up', 'down']).sum(), axis=1)
+    return X_train, X_val, X_test, y_train, y_val, y_test
 
-    # Binary helper features
-    df['any_medication_change'] = (df['num_adjusted_medications'] > 0).astype(int)
-    df['on_insulin'] = (df['insulin'] != 'no').astype(int)
 
-    return df
+def build_pipeline() -> Pipeline:
+    """Build the complete preprocessing -> encoding -> model pipeline."""
 
-# Load data and return dataframe
-def load_data():
+    return Pipeline(
+        steps=[
+            ("features", ReadmissionFeatureEngineer()),
+            ("vectorizer", DictVectorizer()),
+            (
+                "model",
+                RandomForestClassifier(
+                    n_estimators=200,
+                    max_depth=15,
+                    min_samples_leaf=3,
+                    class_weight="balanced",
+                    max_features="sqrt",
+                    n_jobs=-1,
+                    random_state=RANDOM_STATE,
+                ),
+            ),
+        ]
+    )
 
-    data_url = 'data/diabetic_data.csv'
 
-    df = pd.read_csv(data_url)
+def choose_threshold(y_true: pd.Series, probabilities: np.ndarray) -> float:
+    """Choose a classification threshold using validation data only.
 
-    df = df.replace('?', np.nan)
+    The test set is never used to choose this threshold.
+    """
+    best_threshold = 0.50
+    best_f1 = -1.0
 
-    # Drop columns with 30 to 90% null values
-    df = df.drop(columns=[
-        'weight',
-        'max_glu_serum',
-        'A1Cresult',
-        'medical_specialty',
-        'payer_code'
-    ], axis=1)
+    for threshold in np.arange(0.05, 0.51, 0.01):
+        predictions = (probabilities >= threshold).astype(int)
+        score = f1_score(y_true, predictions, zero_division=0)
 
-    # Handle missing values and format categorical values
-    cat_cols = df.select_dtypes(include=['object']).columns
-    num_cols = df.select_dtypes(include=['number']).columns
+        if score > best_f1:
+            best_f1 = score
+            best_threshold = float(round(threshold, 2))
 
-    for c in cat_cols:
-        df[c] = df[c].str.lower().str.replace(' ', '_')
+    return best_threshold
 
-    df[cat_cols] = df[cat_cols].fillna('NA')
-    df[num_cols] = df[num_cols].fillna(0.0)
 
-    # Map age
-    age_map = {
-        '[0-10)': 5,
-        '[10-20)': 15,
-        '[20-30)': 25,
-        '[30-40)': 35,
-        '[40-50)': 45,
-        '[50-60)': 55,
-        '[60-70)': 65,
-        '[70-80)': 75,
-        '[80-90)': 85,
-        '[90-100)': 95
+def evaluate(
+    y_true: pd.Series, probabilities: np.ndarray, threshold: float
+) -> dict:
+    predictions = (probabilities >= threshold).astype(int)
+
+    return {
+        "threshold": threshold,
+        "accuracy": float(accuracy_score(y_true, predictions)),
+        "precision": float(
+            precision_score(y_true, predictions, zero_division=0)
+        ),
+        "recall": float(recall_score(y_true, predictions, zero_division=0)),
+        "f1": float(f1_score(y_true, predictions, zero_division=0)),
+        "roc_auc": float(roc_auc_score(y_true, probabilities)),
+        "confusion_matrix": confusion_matrix(y_true, predictions).tolist(),
+        "positive_rate": float(np.mean(predictions)),
     }
-    df['age'] = df['age'].map(age_map)
 
-    df['readmitted'] = df['readmitted'].apply(lambda x: 1 if x=='<30' else 0 )
 
-    df = df.drop(columns=['encounter_id', 'patient_nbr'], errors='ignore')
+def main() -> None:
+    df = load_raw_data()
+    X, y = prepare_target(df)
 
-    df = engineer_features(df)
-    
-    return df
+    X_train, X_val, X_test, y_train, y_val, y_test = patient_level_split(X, y)
 
-def train_model(df):
-
-    y_train = df.readmitted.values
-
-    numerical = [
-        'time_in_hospital',
-        'num_lab_procedures',
-        'num_procedures',
-        'num_medications',
-        'number_outpatient',
-        'number_emergency',
-        'number_inpatient',
-        'number_diagnoses',
-        'total_previous_visits',
-        'had_previous_inpatient',
-        'avg_medications_per_day',
-        'procedure_to_lab_ratio',
-        'num_medications_used',
-        'num_adjusted_medications',
-        'any_medication_change',
-        'on_insulin'
-    ]
-
-    categorical = [
-        'race',
-        'gender', 
-        'age', 
-        'diag_1', 
-        'diag_2', 
-        'diag_3', 
-        'metformin',
-        'repaglinide',
-        'nateglinide',
-        'chlorpropamide',
-        'glimepiride',
-        'acetohexamide',
-        'glipizide',
-        'glyburide', 
-        'tolbutamide',
-        'pioglitazone',
-        'rosiglitazone',
-        'acarbose',
-        'miglitol',
-        'troglitazone',
-        'tolazamide',
-        'examide',
-        'citoglipton',
-        'insulin',
-        'glyburide-metformin',
-        'glipizide-metformin',
-        'glimepiride-pioglitazone',
-        'metformin-rosiglitazone',
-        'metformin-pioglitazone',
-        'change',
-        'diabetesMed'
-    ]
-
-    pipeline = make_pipeline(
-        DictVectorizer(),
-        RandomForestClassifier(
-            max_depth=15,
-            min_samples_leaf=3,
-            class_weight='balanced',
-            max_features='sqrt',
-            n_jobs=-1,
-            random_state=1)
+    print(
+        "Split sizes:",
+        f"train={len(X_train)}, val={len(X_val)}, test={len(X_test)}",
+    )
+    print(
+        "Positive rates:",
+        f"train={y_train.mean():.4f}, val={y_val.mean():.4f}, test={y_test.mean():.4f}",
     )
 
-    train_dict = df[categorical + numerical].to_dict(orient='records') # DictVectorizer turns the dataframe into a dictionary, which is one-hot encoding
-    pipeline.fit(train_dict, y_train)
+    # First fit only on training data. Validation is used only for threshold
+    # selection; the test set remains untouched.
+    validation_pipeline = build_pipeline()
+    validation_pipeline.fit(
+        X_train.to_dict(orient="records"),
+        y_train.to_numpy(),
+    )
 
-    return pipeline
+    val_probabilities = validation_pipeline.predict_proba(
+        X_val.to_dict(orient="records")
+    )[:, 1]
+    threshold = choose_threshold(y_val, val_probabilities)
 
-def save_model(filename, model):
-    with open(filename, 'wb') as f_out:
-        pickle.dump(model, f_out)
+    # After model/threshold selection, refit the model on train + validation.
+    # The test set remains completely untouched until final evaluation.
+    X_train_final = pd.concat([X_train, X_val], axis=0)
+    y_train_final = pd.concat([y_train, y_val], axis=0)
 
-    print(f'model saved to {filename}')
+    final_pipeline = build_pipeline()
+    final_pipeline.fit(
+        X_train_final.to_dict(orient="records"),
+        y_train_final.to_numpy(),
+    )
 
-df = load_data()
-pipeline = train_model(df)
-save_model('model/model.bin', pipeline)
+    test_probabilities = final_pipeline.predict_proba(
+        X_test.to_dict(orient="records")
+    )[:, 1]
+    test_metrics = evaluate(y_test, test_probabilities, threshold)
+
+    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with MODEL_PATH.open("wb") as f_out:
+        pickle.dump(
+            {
+                "pipeline": final_pipeline,
+                "threshold": threshold,
+                "target_definition": "readmitted_within_30_days",
+            },
+            f_out,
+        )
+
+    metrics = {
+        "split": {
+            "train_rows": len(X_train),
+            "validation_rows": len(X_val),
+            "test_rows": len(X_test),
+            "train_patients": int(X_train["patient_nbr"].nunique()),
+            "validation_patients": int(X_val["patient_nbr"].nunique()),
+            "test_patients": int(X_test["patient_nbr"].nunique()),
+        },
+        "validation_threshold": threshold,
+        "test": test_metrics,
+    }
+
+    with METRICS_PATH.open("w", encoding="utf-8") as f_out:
+        json.dump(metrics, f_out, indent=2)
+
+    print(json.dumps(test_metrics, indent=2))
+    print(f"Saved model to {MODEL_PATH}")
+    print(f"Saved metrics to {METRICS_PATH}")
+
+
+if __name__ == "__main__":
+    main()
