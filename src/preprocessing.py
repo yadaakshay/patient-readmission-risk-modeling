@@ -79,22 +79,6 @@ NUMERIC_COLUMNS = {
     "admission_source_id",
 }
 
-CATEGORICAL_COLUMNS = {
-    "race",
-    "gender",
-    "diag_1",
-    "diag_2",
-    "diag_3",
-    "A1Cresult",
-    "max_glu_serum",
-    "change",
-    "diabetesMed",
-    *MEDICATION_COLUMNS,
-}
-
-# These are the skewed log features retained by the original notebook's
-# final feature set. The transformation is deterministic and does not learn
-# anything from the target.
 LOG_COLUMNS = {
     "number_emergency",
     "patient_service",
@@ -125,6 +109,10 @@ def _diagnosis_group(value: Any) -> str:
     """Map ICD-9-style diagnosis codes into the notebook's 8 groups."""
 
     if _is_missing(value) or value == "?":
+        return "group_0"
+
+    text = str(value).upper()
+    if text.startswith("V") or text.startswith("E"):
         return "group_0"
 
     try:
@@ -198,7 +186,7 @@ def _recode_source(value: Any) -> str:
 
 
 class ReadmissionFeatureEngineer(BaseEstimator, TransformerMixin):
-    """Create the final model features from raw hospital encounters."""
+    """Create final model features from raw hospital encounters."""
 
     def fit(self, X: Iterable[Dict[str, Any]], y=None):
         return self
@@ -209,16 +197,20 @@ class ReadmissionFeatureEngineer(BaseEstimator, TransformerMixin):
         for raw in X:
             row = dict(raw)
 
-            # Remove high-missing/irrelevant raw columns.
             for column in DROP_HIGH_MISSING_COLUMNS | DROP_COLUMNS:
                 row.pop(column, None)
 
             age_value = row.get("age")
-            age = AGE_MAP.get(age_value, 0.0)
+            age = AGE_MAP.get(
+                age_value,
+                _numeric(age_value),
+            )
 
-            # Medication summary features from the original notebook.
             medication_values = [
-                _categorical(row.get(column), default="No")
+                _categorical(
+                    row.get(column),
+                    default="no",
+                )
                 for column in MEDICATION_COLUMNS
             ]
 
@@ -226,25 +218,38 @@ class ReadmissionFeatureEngineer(BaseEstimator, TransformerMixin):
                 value in {"up", "down"}
                 for value in medication_values
             )
-
             num_med = sum(
                 value != "no"
                 for value in medication_values
             )
 
-            outpatient = _numeric(row.get("number_outpatient"))
-            emergency = _numeric(row.get("number_emergency"))
-            inpatient = _numeric(row.get("number_inpatient"))
-            time_in_hospital = _numeric(row.get("time_in_hospital"))
-            num_procedures = _numeric(row.get("num_procedures"))
-            num_medications = _numeric(row.get("num_medications"))
+            outpatient = _numeric(
+                row.get("number_outpatient")
+            )
+            emergency = _numeric(
+                row.get("number_emergency")
+            )
+            inpatient = _numeric(
+                row.get("number_inpatient")
+            )
+            time_in_hospital = _numeric(
+                row.get("time_in_hospital")
+            )
+            num_procedures = _numeric(
+                row.get("num_procedures")
+            )
+            num_medications = _numeric(
+                row.get("num_medications")
+            )
+            num_lab_procedures = _numeric(
+                row.get("num_lab_procedures")
+            )
 
             patient_service = (
                 outpatient + emergency + inpatient
             )
 
             features: Dict[str, Any] = {
-                # Notebook-style categorical features.
                 "race": _categorical(row.get("race")),
                 "gender": _categorical(row.get("gender")),
                 "admission_type_id": _recode_admission_type(
@@ -277,52 +282,12 @@ class ReadmissionFeatureEngineer(BaseEstimator, TransformerMixin):
                 "diabetesMed": _categorical(
                     row.get("diabetesMed")
                 ),
-
-                # Continuous features.
                 "age": age,
-                "num_lab_procedures": _numeric(
-                    row.get("num_lab_procedures")
-                ),
+                "num_lab_procedures": num_lab_procedures,
                 "number_diagnoses": _numeric(
                     row.get("number_diagnoses")
                 ),
                 "num_med": float(num_med),
-
-                # Medication features retained by the notebook.
-                **{
-                    column: (
-                        0.0
-                        if value == "no"
-                        else 1.0
-                    )
-                    for column, value in zip(
-                        MEDICATION_COLUMNS,
-                        medication_values,
-                    )
-                    if column in {
-                        "metformin",
-                        "repaglinide",
-                        "nateglinide",
-                        "chlorpropamide",
-                        "glimepiride",
-                        "glipizide",
-                        "glyburide",
-                        "tolbutamide",
-                        "pioglitazone",
-                        "rosiglitazone",
-                        "acarbose",
-                        "miglitol",
-                        "troglitazone",
-                        "tolazamide",
-                        "insulin",
-                        "glyburide-metformin",
-                        "glipizide-metformin",
-                        "glimepiride-pioglitazone",
-                        "metformin-rosiglitazone",
-                        "metformin-pioglitazone",
-                        "acetohexamide",
-                    }
-                },
                 "med_change": float(med_change),
                 "patient_service": patient_service,
                 "number_emergency": emergency,
@@ -331,9 +296,32 @@ class ReadmissionFeatureEngineer(BaseEstimator, TransformerMixin):
                 "number_outpatient": outpatient,
                 "num_medications": num_medications,
                 "number_inpatient": inpatient,
+                "total_previous_visits": patient_service,
+                "had_previous_inpatient": float(inpatient > 0),
+                "avg_medications_per_day": (
+                    num_medications / (time_in_hospital + 1)
+                ),
+                "procedure_to_lab_ratio": (
+                    num_procedures / (num_lab_procedures + 1)
+                ),
+                "num_medications_used": float(num_med),
+                "num_adjusted_medications": float(med_change),
+                "any_medication_change": float(med_change > 0),
+                "on_insulin": float(
+                    _categorical(row.get("insulin"), default="no")
+                    in {"steady", "up", "down"}
+                ),
             }
 
-            # Log1p features used in the notebook's final feature set.
+            # Preserve medication indicators used by the notebook.
+            for column, value in zip(
+                MEDICATION_COLUMNS,
+                medication_values,
+            ):
+                features[column] = (
+                    0.0 if value == "no" else 1.0
+                )
+
             raw_log_values = {
                 "number_emergency": emergency,
                 "patient_service": patient_service,
