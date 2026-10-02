@@ -1,11 +1,15 @@
 [project]
 name = "hospital-readmission-prediction"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.3.0"
+description = "Patient-level hospital readmission risk prediction with leakage-safe model comparison and FastAPI inference"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.121.1",
+    "imbalanced-learn>=0.14.0",
+    "numpy>=2.0",
+    "pandas>=2.2",
     "scikit-learn>=1.7.2",
     "uvicorn>=0.38.0",
+    "xgboost>=3.0.0",
 ]

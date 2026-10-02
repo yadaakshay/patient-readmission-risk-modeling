@@ -1,186 +1,532 @@
 #!/usr/bin/env python
-# coding: utf-8
+"""Leakage-safe training and model comparison for hospital readmission."""
 
-# To save our model, we use pickle, a system import
+from __future__ import annotations
+
+import json
 import pickle
+from pathlib import Path
 
-import pandas as pd
 import numpy as np
-import sklearn
-
-from sklearn.pipeline import make_pipeline # What does this do
-from sklearn.feature_extraction import DictVectorizer
+import pandas as pd
+from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_extraction import DictVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from sklearn.model_selection import GridSearchCV, StratifiedGroupKFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.tree import DecisionTreeClassifier
+from xgboost import XGBClassifier
+from sklearn.base import clone
 
-print(f'pandas=={pd.__version__}')
-print(f'numpy=={np.__version__}')
-print(f'sklearn=={sklearn.__version__}')
+from src.preprocessing import ReadmissionFeatureEngineer
 
-# Feature engineering function
-def engineer_features(df):
-    # Create additional predictive features while preserving the original columns.
 
-    # -------- Visit history / intensity features --------
-    df['total_previous_visits'] = (
-        df['number_outpatient'] + df['number_emergency'] + df['number_inpatient']
+DATA_PATH = Path("data/diabetic_data.csv")
+MODEL_PATH = Path("model/model.bin")
+METRICS_PATH = Path("model/metrics.json")
+
+RANDOM_STATE = 42
+CV_FOLDS = 10
+
+
+def load_raw_data() -> pd.DataFrame:
+    return pd.read_csv(DATA_PATH)
+
+
+def prepare_target(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+    if "readmitted" not in df.columns:
+        raise ValueError("Expected 'readmitted' target column.")
+
+    y = (df["readmitted"] == "<30").astype(int)
+    return df.drop(columns=["readmitted"]), y
+
+
+def patient_level_split(
+    X: pd.DataFrame,
+    y: pd.Series,
+) -> tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.Series,
+    pd.Series,
+    pd.Series,
+]:
+    """Create approximately 60/20/20 patient-disjoint splits."""
+
+    if "patient_nbr" not in X.columns:
+        raise ValueError("patient_nbr is required for grouped splitting.")
+
+    groups = X["patient_nbr"]
+
+    # Five stratified groups gives an approximately 20% patient-level test set.
+    outer_cv = StratifiedGroupKFold(
+        n_splits=5,
+        shuffle=True,
+        random_state=RANDOM_STATE,
+    )
+    train_val_idx, test_idx = next(
+        outer_cv.split(X, y, groups=groups)
     )
 
-    df['had_previous_inpatient'] = (df['number_inpatient'] > 0).astype(int)
+    X_train_val = X.iloc[train_val_idx].copy()
+    y_train_val = y.iloc[train_val_idx].copy()
 
-    # Avoid division by zero by adding +1 to the denominator
-    df['avg_medications_per_day'] = df['num_medications'] / (df['time_in_hospital'] + 1)
-    df['procedure_to_lab_ratio'] = df['num_procedures'] / (df['num_lab_procedures'] + 1)
+    # Four groups on the remaining 80% gives an approximately 20% validation
+    # set overall.
+    inner_cv = StratifiedGroupKFold(
+        n_splits=4,
+        shuffle=True,
+        random_state=RANDOM_STATE,
+    )
+    inner_groups = X_train_val["patient_nbr"]
 
-    # -------- Medication change summaries --------
-    med_cols = [
-        'metformin','repaglinide','nateglinide','chlorpropamide','glimepiride',
-        'acetohexamide','glipizide','glyburide','tolbutamide','pioglitazone',
-        'rosiglitazone','acarbose','miglitol','troglitazone','tolazamide',
-        'examide','citoglipton','insulin'
+    train_idx, val_idx = next(
+        inner_cv.split(
+            X_train_val,
+            y_train_val,
+            groups=inner_groups,
+        )
+    )
+
+    X_train = X_train_val.iloc[train_idx].copy()
+    X_val = X_train_val.iloc[val_idx].copy()
+    X_test = X.iloc[test_idx].copy()
+
+    y_train = y_train_val.iloc[train_idx].copy()
+    y_val = y_train_val.iloc[val_idx].copy()
+    y_test = y.iloc[test_idx].copy()
+
+    train_patients = set(X_train["patient_nbr"])
+    val_patients = set(X_val["patient_nbr"])
+    test_patients = set(X_test["patient_nbr"])
+
+    assert train_patients.isdisjoint(val_patients)
+    assert train_patients.isdisjoint(test_patients)
+    assert val_patients.isdisjoint(test_patients)
+
+    return (
+        X_train,
+        X_val,
+        X_test,
+        y_train,
+        y_val,
+        y_test,
+    )
+
+
+def _base_steps(*, scale: bool) -> list[tuple[str, object]]:
+    steps: list[tuple[str, object]] = [
+        ("features", ReadmissionFeatureEngineer()),
+        ("vectorizer", DictVectorizer()),
     ]
 
-    # Count how many meds are used at all (value != 'no')
-    df['num_medications_used'] = df[med_cols].apply(lambda row: (row != 'no').sum(), axis=1)
+    if scale:
+        # Sparse-safe standardization for logistic regression. Tree models do
+        # not need feature scaling.
+        steps.append(
+            ("scaler", StandardScaler(with_mean=False))
+        )
 
-    # Count meds with dose adjustment (value in {'up','down'})
-    df['num_adjusted_medications'] = df[med_cols].apply(lambda row: row.isin(['up', 'down']).sum(), axis=1)
+    steps.append(
+        (
+            "smote",
+            SMOTE(
+                random_state=RANDOM_STATE,
+                k_neighbors=5,
+            ),
+        )
+    )
 
-    # Binary helper features
-    df['any_medication_change'] = (df['num_adjusted_medications'] > 0).astype(int)
-    df['on_insulin'] = (df['insulin'] != 'no').astype(int)
+    return steps
 
-    return df
 
-# Load data and return dataframe
-def load_data():
+def build_model_searches() -> dict[str, tuple[Pipeline, dict]]:
+    """Return notebook-inspired model families and small tuning grids."""
 
-    data_url = 'data/diabetic_data.csv'
+    searches: dict[str, tuple[Pipeline, dict]] = {}
 
-    df = pd.read_csv(data_url)
+    searches["logistic_regression"] = (
+        Pipeline(
+            steps=_base_steps(scale=True)
+            + [
+                (
+                    "model",
+                    LogisticRegression(
+                        penalty="l2",
+                        solver="liblinear",
+                        max_iter=1000,
+                        random_state=RANDOM_STATE,
+                    ),
+                )
+            ]
+        ),
+        {
+            "model__C": [0.1, 1.0],
+        },
+    )
 
-    df = df.replace('?', np.nan)
+    searches["decision_tree"] = (
+        Pipeline(
+            steps=_base_steps(scale=False)
+            + [
+                (
+                    "model",
+                    DecisionTreeClassifier(
+                        random_state=RANDOM_STATE,
+                    ),
+                )
+            ]
+        ),
+        {
+            "model__criterion": ["gini", "entropy"],
+            "model__max_depth": [15, 25],
+            "model__min_samples_leaf": [5],
+        },
+    )
 
-    # Drop columns with 30 to 90% null values
-    df = df.drop(columns=[
-        'weight',
-        'max_glu_serum',
-        'A1Cresult',
-        'medical_specialty',
-        'payer_code'
-    ], axis=1)
+    searches["random_forest"] = (
+        Pipeline(
+            steps=_base_steps(scale=False)
+            + [
+                (
+                    "model",
+                    RandomForestClassifier(
+                        n_estimators=200,
+                        max_features="sqrt",
+                        n_jobs=1,
+                        random_state=RANDOM_STATE,
+                    ),
+                )
+            ]
+        ),
+        {
+            "model__max_depth": [15, 25],
+            "model__min_samples_leaf": [3],
+        },
+    )
 
-    # Handle missing values and format categorical values
-    cat_cols = df.select_dtypes(include=['object']).columns
-    num_cols = df.select_dtypes(include=['number']).columns
+    searches["xgboost"] = (
+        Pipeline(
+            steps=_base_steps(scale=False)
+            + [
+                (
+                    "model",
+                    XGBClassifier(
+                        objective="binary:logistic",
+                        eval_metric="logloss",
+                        n_estimators=300,
+                        learning_rate=0.05,
+                        subsample=0.8,
+                        colsample_bytree=0.8,
+                        n_jobs=1,
+                        random_state=RANDOM_STATE,
+                    ),
+                )
+            ]
+        ),
+        {
+            "model__max_depth": [4, 6],
+        },
+    )
 
-    for c in cat_cols:
-        df[c] = df[c].str.lower().str.replace(' ', '_')
+    return searches
 
-    df[cat_cols] = df[cat_cols].fillna('NA')
-    df[num_cols] = df[num_cols].fillna(0.0)
 
-    # Map age
-    age_map = {
-        '[0-10)': 5,
-        '[10-20)': 15,
-        '[20-30)': 25,
-        '[30-40)': 35,
-        '[40-50)': 45,
-        '[50-60)': 55,
-        '[60-70)': 65,
-        '[70-80)': 75,
-        '[80-90)': 85,
-        '[90-100)': 95
-    }
-    df['age'] = df['age'].map(age_map)
+def build_cv() -> StratifiedGroupKFold:
+    return StratifiedGroupKFold(
+        n_splits=CV_FOLDS,
+        shuffle=True,
+        random_state=RANDOM_STATE,
+    )
 
-    df['readmitted'] = df['readmitted'].apply(lambda x: 1 if x=='<30' else 0 )
 
-    df = df.drop(columns=['encounter_id', 'patient_nbr'], errors='ignore')
+def tune_models(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+) -> tuple[str, Pipeline, dict, dict]:
+    """Compare the notebook's model families using leakage-safe grouped CV."""
 
-    df = engineer_features(df)
-    
-    return df
+    results: dict = {}
+    best_name = ""
+    best_score = -np.inf
+    best_estimator = None
+    best_params = None
 
-def train_model(df):
+    for name, (pipeline, param_grid) in build_model_searches().items():
+        print(f"\n===== {name} =====")
 
-    y_train = df.readmitted.values
-
-    numerical = [
-        'time_in_hospital',
-        'num_lab_procedures',
-        'num_procedures',
-        'num_medications',
-        'number_outpatient',
-        'number_emergency',
-        'number_inpatient',
-        'number_diagnoses',
-        'total_previous_visits',
-        'had_previous_inpatient',
-        'avg_medications_per_day',
-        'procedure_to_lab_ratio',
-        'num_medications_used',
-        'num_adjusted_medications',
-        'any_medication_change',
-        'on_insulin'
-    ]
-
-    categorical = [
-        'race',
-        'gender', 
-        'age', 
-        'diag_1', 
-        'diag_2', 
-        'diag_3', 
-        'metformin',
-        'repaglinide',
-        'nateglinide',
-        'chlorpropamide',
-        'glimepiride',
-        'acetohexamide',
-        'glipizide',
-        'glyburide', 
-        'tolbutamide',
-        'pioglitazone',
-        'rosiglitazone',
-        'acarbose',
-        'miglitol',
-        'troglitazone',
-        'tolazamide',
-        'examide',
-        'citoglipton',
-        'insulin',
-        'glyburide-metformin',
-        'glipizide-metformin',
-        'glimepiride-pioglitazone',
-        'metformin-rosiglitazone',
-        'metformin-pioglitazone',
-        'change',
-        'diabetesMed'
-    ]
-
-    pipeline = make_pipeline(
-        DictVectorizer(),
-        RandomForestClassifier(
-            max_depth=15,
-            min_samples_leaf=3,
-            class_weight='balanced',
-            max_features='sqrt',
+        search = GridSearchCV(
+            estimator=pipeline,
+            param_grid=param_grid,
+            scoring="roc_auc",
+            cv=build_cv(),
             n_jobs=-1,
-            random_state=1)
+            refit=True,
+            return_train_score=False,
+        )
+
+        search.fit(
+            X_train.to_dict(orient="records"),
+            y_train.to_numpy(),
+            groups=X_train["patient_nbr"].to_numpy(),
+        )
+
+        score = float(search.best_score_)
+
+        results[name] = {
+            "cv_roc_auc": score,
+            "best_params": search.best_params_,
+        }
+
+        print(f"Best CV ROC-AUC: {score:.4f}")
+        print(f"Best parameters: {search.best_params_}")
+
+        if score > best_score:
+            best_score = score
+            best_name = name
+            best_estimator = search.best_estimator_
+            best_params = search.best_params_
+
+    assert best_estimator is not None
+    assert best_params is not None
+
+    return (
+        best_name,
+        best_estimator,
+        best_params,
+        results,
     )
 
-    train_dict = df[categorical + numerical].to_dict(orient='records') # DictVectorizer turns the dataframe into a dictionary, which is one-hot encoding
-    pipeline.fit(train_dict, y_train)
 
-    return pipeline
+def choose_threshold(
+    y_true: pd.Series,
+    probabilities: np.ndarray,
+) -> float:
+    """Choose threshold on validation data only."""
 
-def save_model(filename, model):
-    with open(filename, 'wb') as f_out:
-        pickle.dump(model, f_out)
+    best_threshold = 0.50
+    best_f1 = -1.0
 
-    print(f'model saved to {filename}')
+    for threshold in np.arange(0.05, 0.51, 0.01):
+        predictions = (probabilities >= threshold).astype(int)
+        score = f1_score(
+            y_true,
+            predictions,
+            zero_division=0,
+        )
 
-df = load_data()
-pipeline = train_model(df)
-save_model('model/model.bin', pipeline)
+        if score > best_f1:
+            best_f1 = score
+            best_threshold = float(round(threshold, 2))
+
+    return best_threshold
+
+
+def evaluate(
+    y_true: pd.Series,
+    probabilities: np.ndarray,
+    threshold: float,
+) -> dict:
+    predictions = (probabilities >= threshold).astype(int)
+
+    return {
+        "threshold": threshold,
+        "accuracy": float(
+            accuracy_score(y_true, predictions)
+        ),
+        "precision": float(
+            precision_score(
+                y_true,
+                predictions,
+                zero_division=0,
+            )
+        ),
+        "recall": float(
+            recall_score(
+                y_true,
+                predictions,
+                zero_division=0,
+            )
+        ),
+        "f1": float(
+            f1_score(
+                y_true,
+                predictions,
+                zero_division=0,
+            )
+        ),
+        "roc_auc": float(
+            roc_auc_score(y_true, probabilities)
+        ),
+        "confusion_matrix": confusion_matrix(
+            y_true,
+            predictions,
+        ).tolist(),
+        "positive_rate": float(
+            np.mean(predictions)
+        ),
+    }
+
+
+def main() -> None:
+    df = load_raw_data()
+    X, y = prepare_target(df)
+
+    (
+        X_train,
+        X_val,
+        X_test,
+        y_train,
+        y_val,
+        y_test,
+    ) = patient_level_split(X, y)
+
+    print(
+        "Split sizes:",
+        f"train={len(X_train)}",
+        f"val={len(X_val)}",
+        f"test={len(X_test)}",
+    )
+    print(
+        "Positive rates:",
+        f"train={y_train.mean():.4f}",
+        f"val={y_val.mean():.4f}",
+        f"test={y_test.mean():.4f}",
+    )
+
+    # Model selection happens only inside the training patients.
+    (
+        best_name,
+        best_cv_estimator,
+        best_params,
+        cv_results,
+    ) = tune_models(X_train, y_train)
+
+    # The CV-refit estimator has only seen training patients. Use the separate
+    # validation patients solely to choose the probability threshold.
+    val_probabilities = best_cv_estimator.predict_proba(
+        X_val.to_dict(orient="records")
+    )[:, 1]
+
+    threshold = choose_threshold(
+        y_val,
+        val_probabilities,
+    )
+
+    print(
+        f"\nSelected model: {best_name}"
+    )
+    print(
+        f"Validation threshold: {threshold:.2f}"
+    )
+
+    # Refit a fresh copy on train + validation only, after every modeling
+    # decision has been made.
+    final_pipeline = clone(best_cv_estimator)
+
+    X_train_final = pd.concat(
+        [X_train, X_val],
+        axis=0,
+    )
+    y_train_final = pd.concat(
+        [y_train, y_val],
+        axis=0,
+    )
+
+    final_pipeline.fit(
+        X_train_final.to_dict(
+            orient="records"
+        ),
+        y_train_final.to_numpy(),
+    )
+
+    # The test patients have not been used for model selection, threshold
+    # selection, or hyperparameter tuning.
+    test_probabilities = final_pipeline.predict_proba(
+        X_test.to_dict(orient="records")
+    )[:, 1]
+
+    test_metrics = evaluate(
+        y_test,
+        test_probabilities,
+        threshold,
+    )
+
+    MODEL_PATH.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    with MODEL_PATH.open("wb") as f_out:
+        pickle.dump(
+            {
+                "pipeline": final_pipeline,
+                "threshold": threshold,
+                "model_name": best_name,
+                "target_definition": "readmitted_within_30_days",
+            },
+            f_out,
+        )
+
+    metrics = {
+        "methodology": {
+            "target": "<30 vs >30/NO",
+            "outer_split": "patient-disjoint stratified group split",
+            "cv": "10-fold StratifiedGroupKFold",
+            "smote": "inside each CV training fold only",
+            "model_selection_metric": "roc_auc",
+            "threshold_metric": "f1 on validation set",
+            "final_test": "untouched until final evaluation",
+        },
+        "split": {
+            "train_rows": len(X_train),
+            "validation_rows": len(X_val),
+            "test_rows": len(X_test),
+            "train_patients": int(
+                X_train["patient_nbr"].nunique()
+            ),
+            "validation_patients": int(
+                X_val["patient_nbr"].nunique()
+            ),
+            "test_patients": int(
+                X_test["patient_nbr"].nunique()
+            ),
+        },
+        "model_comparison": cv_results,
+        "selected_model": best_name,
+        "selected_model_cv_roc_auc": cv_results[
+            best_name
+        ]["cv_roc_auc"],
+        "validation_threshold": threshold,
+        "test": test_metrics,
+    }
+
+    with METRICS_PATH.open(
+        "w",
+        encoding="utf-8",
+    ) as f_out:
+        json.dump(
+            metrics,
+            f_out,
+            indent=2,
+        )
+
+    print("\nFinal untouched-test metrics:")
+    print(json.dumps(test_metrics, indent=2))
+    print(f"\nSaved model to {MODEL_PATH}")
+    print(f"Saved metrics to {METRICS_PATH}")
+
+
+if __name__ == "__main__":
+    main()

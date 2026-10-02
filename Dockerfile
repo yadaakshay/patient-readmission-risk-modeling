@@ -9,7 +9,7 @@ WORKDIR /app
 ENV PATH="/app/.venv/bin:$PATH"
 
 COPY ".python-version" "pyproject.toml" "uv.lock" "./"
-RUN uv sync --locked
+RUN uv sync
 
 COPY src/ ./src/
 COPY model/model.bin ./model/model.bin
