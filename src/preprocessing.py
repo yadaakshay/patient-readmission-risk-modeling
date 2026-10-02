@@ -35,6 +35,16 @@ AGE_MAP = {
     "[90-100)": 95,
 }
 
+CATEGORICAL_COLUMNS = [
+    "race", "gender", "age", "diag_1", "diag_2", "diag_3",
+    "metformin", "repaglinide", "nateglinide", "chlorpropamide", "glimepiride",
+    "acetohexamide", "glipizide", "glyburide", "tolbutamide", "pioglitazone",
+    "rosiglitazone", "acarbose", "miglitol", "troglitazone", "tolazamide",
+    "examide", "citoglipton", "insulin", "glyburide-metformin",
+    "glipizide-metformin", "glimepiride-pioglitazone", "metformin-rosiglitazone",
+    "metformin-pioglitazone", "change", "diabetesMed",
+]
+
 MEDICATION_COLUMNS = [
     "metformin",
     "repaglinide",
@@ -113,6 +123,14 @@ class ReadmissionFeatureEngineer(BaseEstimator, TransformerMixin):
             row.pop("readmitted", None)
             row.pop("encounter_id", None)
             row.pop("patient_nbr", None)
+
+            # Make missing schema fields explicit so training and inference have
+            # identical semantics. Missing categorical values become the learned
+            # "NA" category; missing numeric values become 0.
+            for column in NUMERIC_COLUMNS:
+                row.setdefault(column, 0.0)
+            for column in CATEGORICAL_COLUMNS:
+                row.setdefault(column, "NA")
 
             # Visit-history features.
             outpatient = float(row.get("number_outpatient", 0) or 0)
