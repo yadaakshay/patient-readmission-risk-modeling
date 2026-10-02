@@ -1,86 +1,217 @@
 # Patient Readmission Risk Modeling
 
-An end-to-end machine-learning project for predicting whether a diabetic patient will be **readmitted within 30 days** using hospital encounter data.
+An end-to-end machine-learning project for predicting whether a diabetic
+patient will be **readmitted within 30 days** using hospital encounter data.
 
-The project covers data preparation, feature engineering, classification, model evaluation, and a FastAPI inference service.
+The project started as a notebook-based modeling study and has been rebuilt
+as a reproducible, leakage-safe training and deployment pipeline.
 
-## Important modeling definition
+## Target
 
 The target is:
 
 - `1`: `readmitted == "<30"` — readmitted within 30 days
 - `0`: `readmitted == ">30"` or `"NO"`
 
-The prediction target is intentionally narrower than "any future readmission."
+The prediction target is intentionally narrower than "any future
+readmission."
 
-## Production pipeline
+## What the original notebook did
 
-The production training path is implemented in `src/train.py` and uses:
+The original notebook explored:
 
-1. Load the raw encounter data.
-2. Create the binary readmission target.
-3. Split data at the **patient level**, not the encounter-row level.
-4. Keep train, validation, and test patients disjoint.
-5. Apply the same deterministic preprocessing and feature engineering through `src/preprocessing.py`.
-6. One-hot encode categorical features with `DictVectorizer`.
-7. Train a class-balanced Random Forest.
-8. Select the classification threshold using **validation data only**, optimizing F1.
-9. Refit the selected model on train + validation data.
-10. Evaluate once on the untouched test set.
-11. Save the complete preprocessing + model pipeline and selected threshold to `model/model.bin`.
+- feature engineering
+- Logistic Regression
+- Decision Trees
+- Random Forest
+- XGBoost
+- SMOTE
+- 10-fold cross-validation
+- model metrics and feature importance
 
-### Why the patient-level split matters
+Those ideas are retained, but the experimental design has been corrected.
 
-The source data contains multiple hospital encounters for the same patient. If encounters from one patient appear in both training and test sets, the model can learn patient-specific patterns from the training encounters and receive an unrealistically favorable test evaluation.
+### Problems found in the original notebook
 
-The production split therefore uses `patient_nbr` only for grouping. It is removed before modeling and is never used as a predictive feature.
+The notebook applied SMOTE to the complete dataset before creating its
+train/test split. It also discarded `patient_nbr` before splitting, so
+different encounters from the same patient could cross the split boundary.
 
-### Why threshold tuning matters
+The XGBoost experiments repeatedly used the test set for early stopping and
+hyperparameter exploration. In addition, ROC-AUC was sometimes calculated
+from hard 0/1 predictions instead of probability scores.
 
-A probability of 0.5 is not automatically the correct decision threshold for an imbalanced medical classification problem.
+Those choices can produce optimistic evaluation.
 
-The model produces:
+The repository therefore does **not** copy the notebook's reported ~94%
+XGBoost result as a final performance claim. The model must be retrained
+under the corrected protocol.
+
+## Corrected modeling pipeline
+
+The current training methodology is:
 
 ```
-P(readmitted within 30 days | patient data)
+Raw encounters
+      |
+      v
+Patient-level 60/20/20 split
+      |
+      +------------------------------+
+      |                              |
+      v                              v
+Training patients              Untouched test patients
+      |
+      v
+10-fold StratifiedGroupKFold
+      |
+      +--> fold training patients
+      |       |
+      |       v
+      |   feature engineering
+      |       |
+      |       v
+      |   one-hot encoding
+      |       |
+      |       v
+      |      SMOTE
+      |       |
+      |       v
+      |      model
+      |
+      +--> fold validation patients
+              |
+              v
+        evaluation only
+
+Training CV selects the model.
+Validation patients select the classification threshold.
+Only then is train + validation used for the final fit.
+The test set is evaluated once at the end.
 ```
 
-The validation set is used to choose a threshold for converting that probability into a binary alert. The test set is not used to choose the threshold.
+### Patient-level splitting
 
-The API returns both the probability and the threshold used for the decision.
+The source dataset contains multiple encounters for some patients.
+
+`patient_nbr` is therefore used only as a grouping variable:
+
+- it is never a model feature
+- no patient appears in multiple outer splits
+- no patient appears in multiple CV folds
+
+This prevents the model from seeing one patient's encounters during training
+and another encounter from the same patient during evaluation.
+
+### SMOTE
+
+SMOTE is implemented **inside the imbalanced-learn pipeline**:
+
+```
+feature engineering
+      ↓
+DictVectorizer
+      ↓
+SMOTE
+      ↓
+classifier
+```
+
+Therefore, during cross-validation, synthetic minority observations are
+created only from the training portion of each fold.
+
+SMOTE is never fitted on:
+
+- the CV validation fold
+- the separate validation set
+- the final test set
+
+This avoids resampling leakage.
+
+> Note: standard SMOTE is being applied after one-hot encoding. That can
+> create fractional values in encoded categorical dimensions. A future
+> experiment can compare this with a categorical-aware method such as
+> SMOTENC.
+
+### Cross-validation
+
+The project uses **10-fold StratifiedGroupKFold**.
+
+- **Group:** `patient_nbr`
+- **Stratification:** preserves the class distribution as well as possible
+- **Scoring:** ROC-AUC
+
+Four model families from the notebook are evaluated:
+
+1. Logistic Regression
+2. Decision Tree
+3. Random Forest
+4. XGBoost
+
+The selected production model is the model with the highest mean
+patient-grouped CV ROC-AUC.
+
+The CV results are saved to:
+
+```
+model/metrics.json
+```
+
+No model is selected using the final test set.
 
 ## Feature engineering
 
-The shared transformer in `src/preprocessing.py` creates deterministic features including:
+The shared transformer in `src/preprocessing.py` incorporates the useful
+feature engineering from the original notebook:
 
+### Hospital utilization
+
+- `patient_service`
 - `total_previous_visits`
 - `had_previous_inpatient`
-- `avg_medications_per_day`
-- `procedure_to_lab_ratio`
+
+### Medication behavior
+
+- `num_med`
+- `med_change`
 - `num_medications_used`
 - `num_adjusted_medications`
 - `any_medication_change`
 - `on_insulin`
 
-It also normalizes categorical values, maps age ranges to their midpoint, handles missing values, and ensures missing API fields have the same semantics as missing training fields.
+### Treatment intensity
 
-Most importantly, **the same transformer is serialized inside the production model pipeline**, so training and inference do not use separate preprocessing implementations.
+- `avg_medications_per_day`
+- `procedure_to_lab_ratio`
 
-## Class imbalance
+### Diagnosis grouping
 
-The positive class (readmission within 30 days) is substantially smaller than the negative class. The production Random Forest therefore uses:
+ICD-9 diagnosis codes are grouped into the same clinical categories used
+in the notebook for primary, secondary, and additional diagnoses.
 
-```python
-class_weight="balanced"
-```
+### Skew handling
 
-This increases the relative penalty for misclassifying minority-class examples without synthetically creating new patient records.
+The notebook identified several highly skewed count variables and applied
+log transforms. The production transformer uses a fixed list of those
+transforms instead of calculating skewness on the complete dataset.
 
-The current production pipeline does **not** claim to use SMOTE.
+That distinction matters: estimating transformation choices from the full
+dataset before splitting can leak information across the evaluation
+boundary.
 
-## Evaluation
+### Other preprocessing
 
-The final evaluation reports:
+The pipeline also:
+
+- normalizes categorical values
+- maps age ranges to their midpoint
+- groups admission/discharge/source categories
+- handles missing values
+- preserves the same transformations during API inference
+
+## Model evaluation
+
+The final untouched test set reports:
 
 - Accuracy
 - Precision
@@ -90,42 +221,31 @@ The final evaluation reports:
 - Confusion matrix
 - Positive prediction rate
 
-The metrics are generated by the training script and written to:
+ROC-AUC is calculated from predicted probabilities:
 
-```
-model/metrics.json
-```
-
-No fixed performance number is advertised here because the corrected patient-level split changes the evaluation compared with the earlier encounter-level experiments.
-
-## Repository structure
-
-```
-data/
-    diabetic_data.csv
-
-notebooks/
-    eda.ipynb
-    logistic_regression.ipynb
-    random_forest_xgboost.ipynb
-
-src/
-    preprocessing.py
-    train.py
-    predict.py
-
-model/
-    model.bin
-    metrics.json
-
-Dockerfile
-pyproject.toml
-uv.lock
+```python
+roc_auc_score(y_test, probability)
 ```
 
-The notebooks contain exploratory/model-comparison work. The reproducible production training and deployment path is in `src/`.
+rather than from thresholded 0/1 predictions.
 
-## Train the production model
+### Classification threshold
+
+The model outputs:
+
+```
+P(readmitted within 30 days | patient data)
+```
+
+A 0.5 threshold is not automatically appropriate for an imbalanced
+classification problem.
+
+The classification threshold is selected using the separate validation
+set by maximizing F1 over thresholds from 0.05 to 0.50.
+
+The test set is never used for threshold selection.
+
+## Reproducible training
 
 From the repository root:
 
@@ -134,14 +254,32 @@ uv sync
 uv run python -m src.train
 ```
 
-This creates/updates:
+Training will:
 
-- `model/model.bin`
-- `model/metrics.json`
+1. load the raw dataset
+2. create the target
+3. make patient-disjoint train/validation/test splits
+4. run 10-fold patient-grouped CV
+5. apply SMOTE inside each CV training fold
+6. compare the four model families
+7. select the model using mean CV ROC-AUC
+8. select the decision threshold on validation data
+9. refit the selected pipeline on train + validation
+10. evaluate once on the untouched test set
+11. save the complete inference pipeline and threshold
 
-The current committed model artifact was created by the earlier implementation and should be **regenerated with the corrected training script before deployment**.
+Outputs:
 
-## Run the API
+```
+model/model.bin
+model/metrics.json
+```
+
+The currently committed `model/model.bin` is a legacy artifact from the
+previous implementation and should be regenerated with the command above
+before deployment.
+
+## API
 
 After training:
 
@@ -149,7 +287,7 @@ After training:
 uv run uvicorn src.predict:app --host 0.0.0.0 --port 9696
 ```
 
-Then send a POST request to:
+POST to:
 
 ```
 /predict
@@ -161,35 +299,70 @@ The response contains:
 {
   "readmitted_probability": 0.23,
   "readmitted": true,
-  "decision_threshold": 0.15
+  "decision_threshold": 0.17,
+  "model_name": "random_forest"
 }
 ```
 
-The numbers above are only an example of the response format; they are not reported model performance.
+The numbers are illustrative only.
+
+The API loads the exact serialized preprocessing + model pipeline used
+during training, preventing training-serving preprocessing skew.
 
 ## Docker
 
-Build and run:
+Build:
 
 ```bash
 docker build -t patient-readmission-risk .
+```
+
+Run:
+
+```bash
 docker run -p 9696:9696 patient-readmission-risk
 ```
 
-The Docker image expects the regenerated `model/model.bin`.
+Regenerate `model/model.bin` before deploying the image.
+
+## Repository structure
+
+```
+data/
+    diabetic_data.csv
+
+src/
+    preprocessing.py
+    train.py
+    predict.py
+
+tests/
+    test_pipeline.py
+
+model/
+    model.bin
+    metrics.json
+
+Dockerfile
+pyproject.toml
+uv.lock
+```
+
+The original notebook remains the reference for exploratory analysis.
+The `src/` pipeline is the reproducible implementation.
 
 ## Reproducibility and rollback
 
-Before the production-pipeline changes, the repository was preserved on the branch:
+The exact pre-correction repository state is preserved on:
 
 ```
 backup/baseline-2026-10-02
 ```
 
-The corrected work is being developed on:
+The corrected implementation is developed on:
 
 ```
 fix/robust-readmission-pipeline
 ```
 
-This makes it possible to compare the corrected implementation against the exact previous repository state.
+The original `main` branch is not modified by this work.
