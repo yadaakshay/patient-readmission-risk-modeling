@@ -22,7 +22,7 @@ from sklearn.metrics import (
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.pipeline import Pipeline
 
-from preprocessing import ReadmissionFeatureEngineer
+from src.preprocessing import ReadmissionFeatureEngineer
 
 
 DATA_PATH = Path("data/diabetic_data.csv")
