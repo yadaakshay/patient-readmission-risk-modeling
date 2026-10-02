@@ -70,6 +70,12 @@ MODEL_PATH = os.getenv("MODEL_PATH", "model/model.bin")
 with open(MODEL_PATH, "rb") as f_in:
     artifact = pickle.load(f_in)
 
+if not isinstance(artifact, dict) or "pipeline" not in artifact or "threshold" not in artifact:
+    raise RuntimeError(
+        "model/model.bin uses the legacy artifact format. "
+        "Run 'uv run python -m src.train' to regenerate the corrected model."
+    )
+
 pipeline = artifact["pipeline"]
 THRESHOLD = float(artifact["threshold"])
 
