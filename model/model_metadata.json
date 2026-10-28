@@ -1,0 +1,49 @@
+{
+  "model_name": "lightgbm",
+  "calibrated": true,
+  "optimal_threshold": 0.08470423945241641,
+  "clinical_risk_tiers": {
+    "low_risk_max": 0.0635,
+    "moderate_risk_max": 0.1144
+  },
+  "test_metrics_optimal_threshold": {
+    "roc_auc": 0.6335672912300856,
+    "pr_auc": 0.16162378587581372,
+    "brier_score": 0.07964730932904503,
+    "log_loss": 0.2914751756253858,
+    "threshold": 0.08470423945241641,
+    "accuracy": 0.5740546718735118,
+    "balanced_accuracy": 0.5963565444661307,
+    "sensitivity_recall": 0.623541887592789,
+    "specificity": 0.5691712013394726,
+    "precision": 0.12497343251859724,
+    "f1_score": 0.20821529745042494,
+    "true_positives": 588,
+    "false_positives": 4117,
+    "true_negatives": 5439,
+    "false_negatives": 355
+  },
+  "test_metrics_standard_threshold": {
+    "roc_auc": 0.6335672912300856,
+    "pr_auc": 0.16162378587581372,
+    "brier_score": 0.07964730932904503,
+    "log_loss": 0.2914751756253858,
+    "threshold": 0.5,
+    "accuracy": 0.9101819220878179,
+    "balanced_accuracy": 0.5,
+    "sensitivity_recall": 0.0,
+    "specificity": 1.0,
+    "precision": 0.0,
+    "f1_score": 0.0,
+    "true_positives": 0,
+    "false_positives": 0,
+    "true_negatives": 9556,
+    "false_negatives": 943
+  },
+  "dataset_summary": {
+    "train_size": 48992,
+    "val_size": 10499,
+    "test_size": 10499,
+    "positive_prevalence_pct": 8.979016982364469
+  }
+}
