@@ -1,0 +1,16 @@
+{
+  "best_score_pr_auc": 0.16419010541947235,
+  "best_params": {
+    "subsample": 0.9,
+    "scale_pos_weight": 3.0,
+    "num_leaves": 24,
+    "n_estimators": 250,
+    "min_child_samples": 100,
+    "max_depth": 4,
+    "learning_rate": 0.03,
+    "colsample_bytree": 0.7
+  },
+  "cv_splits": 3,
+  "n_iter": 8,
+  "scoring_metric": "average_precision"
+}

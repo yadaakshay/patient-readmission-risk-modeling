@@ -205,3 +205,11 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Large Datasets and Analytical Databases
+data/*.csv
+data/raw/*.csv
+data/interim/*.parquet
+data/processed/*.parquet
+data/processed/*.db
+*.db

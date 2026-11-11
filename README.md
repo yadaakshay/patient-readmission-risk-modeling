@@ -1,19 +1,20 @@
-# Patient Readmission & Clinical Risk Predictive Modeling
+# Patient Readmission Risk Prediction & Clinical Analytics
 ### *Predicting 30-Day All-Cause Hospital Readmission for Diabetic Inpatients using Electronic Health Records (EHR)*
 
 ![Python](https://img.shields.io/badge/Python-3.12%2B-blue?logo=python)
 ![FastAPI](https://img.shields.io/badge/FastAPI-Production_API-009688?logo=fastapi)
+![Streamlit](https://img.shields.io/badge/Streamlit-Interactive_Dashboard-FF4B4B?logo=streamlit)
 ![Scikit-Learn](https://img.shields.io/badge/Scikit--Learn-Machine_Learning-F7931E?logo=scikitlearn)
 ![LightGBM](https://img.shields.io/badge/LightGBM-Gradient_Boosting-green)
 ![XGBoost](https://img.shields.io/badge/XGBoost-Ensemble-red)
-![Docker](https://img.shields.io/badge/Docker-Containerized-2496ED?logo=docker)
-![Tests](https://img.shields.io/badge/Tests-8%20Passed-brightgreen)
+![SQLite](https://img.shields.io/badge/SQLite-Analytical_Database-003B57?logo=sqlite)
+![Tests](https://img.shields.io/badge/Tests-30%20Passed-brightgreen)
 
-An end-to-end clinical machine learning decision support system designed to predict 30-day hospital readmission risk among diabetic inpatients. Built on 10 years of clinical EHR data across 130 US hospitals (1999–2008), this project adheres to CMS Hospital Readmissions Reduction Program (HRRP) methodology, rigorous clinical feature engineering, probability calibration, and explainable AI (SHAP).
+An end-to-end clinical machine learning and decision-support analytics system designed to predict 30-day hospital readmission risk among diabetic inpatients. Built on 10 years of clinical EHR data across 130 US hospitals (1999–2008), this project adheres to CMS Hospital Readmissions Reduction Program (HRRP) methodology, rigorous clinical feature engineering, probability calibration, explainable AI (SHAP), SQL healthcare analytics, and care team capacity simulation.
 
 ---
 
-## 🏥 Clinical & Business Impact
+## 🏥 Clinical & Business Motivation
 
 Under the **Hospital Readmissions Reduction Program (HRRP)** established by the Centers for Medicare & Medicaid Services (CMS), acute-care hospitals face up to **3% reimbursement penalties** on all Medicare discharges if their 30-day readmission rates exceed national benchmarks.
 
@@ -22,15 +23,34 @@ Under the **Hospital Readmissions Reduction Program (HRRP)** established by the 
 
 ---
 
-## 🔬 Clinical Methodology & Rigorous Engineering
+## 📋 Dataset & Target Definition
+
+### Dataset Source
+- **Study**: *Diabetes 130-US Hospitals (1999–2008)*, Strack et al., Hindawi Publishing Corporation, 2014.
+- **Dimensions**: 101,766 hospital encounters across 71,518 unique patients, 50 raw features.
+- **License / Usage**: Publicly available for educational, scientific, and research purposes.
+
+### Target Definition
+- **Positive Class (`1`)**: Hospital readmission within 30 days (`<30`).
+- **Negative Class (`0`)**: Not readmitted (`NO`) or readmitted after 30 days (`>30`).
+
+### Target Limitations & Clinical Nuances
+1. **Incomplete Follow-Up**: The dataset records readmissions occurring only within the participating 130 hospital network. Readmissions to external hospital systems are unrecorded.
+2. **Post-Discharge Mortality**: Patients who pass away outside the hospital within 30 days of discharge cannot be readmitted, but this EHR does not capture out-of-hospital mortality.
+3. **Planned vs. Unplanned Readmissions**: The historical data does not distinguish between planned elective re-admissions (e.g., staged surgical procedures or scheduled chemotherapy) and acute emergency readmissions.
+4. **Proxy Metric**: Readmission within 30 days serves as a quality proxy, not a direct clinical biomarker of personal diabetes deterioration.
+
+---
+
+## 🛡️ Leakage Prevention & Clinical Cohort Audit
 
 Most public healthcare ML implementations suffer from severe data leakage and methodological oversights. This repository resolves these issues through clinical standards:
 
-1. **Zero Patient Leakage**: Over 16,000 patients in the dataset had multiple hospital encounters. Rather than performing random row-level splitting (which leaks encounters of the same chronic patient across train and test sets), we deduplicate to index (first) patient encounters, ensuring strict patient isolation across splits.
+1. **Zero Patient Leakage**: Over 16,000 patients in the dataset had multiple hospital encounters (up to 40 encounters for a single patient). Rather than performing random row-level splitting (which leaks encounters of the same chronic patient across train and test sets), we deduplicate to index (first) patient encounters, ensuring strict patient isolation across splits.
 2. **Deceased & Hospice Exclusion**: 2,423 patients expired in the hospital or were discharged to hospice (disposition codes 11, 13, 14, 19, 20, 21). Because deceased patients cannot physiologically be readmitted to acute care, retaining them distorts the outcome definition. They are excluded per CMS HRRP guidelines.
-3. **Preservation of Glycemic Indicators (HbA1c & Blood Glucose)**: In the original study (*Strack et al., 2014*), HbA1c testing was ordered in only ~18% of encounters. Treating `'None'` as missing data and dropping `A1Cresult` discards critical clinical intelligence. Here, HbA1c and glucose testing are preserved as vital markers of glycemic monitoring and control.
-4. **Clinical ICD-9 Grouping**: Rather than one-hot encoding thousands of sparse ICD-9 codes, diagnoses are categorized into standard clinical classes (Circulatory, Respiratory, Digestive, Diabetes, Genitourinary, Musculoskeletal, Neoplasms, Injury, Other) and comorbidity flags.
-5. **Probability Calibration**: Tree ensemble raw scores are calibrated via Platt scaling (sigmoid), ensuring that predicted probabilities reflect empirical risk ($Brier\ Score = 0.079$).
+3. **Prediction-Time Temporal Audit**: Features were audited to ensure they represent clinical intelligence available strictly prior to discharge planning. Administrative identifiers (`encounter_id`, `patient_nbr`) and extreme missingness fields (`weight` >96% missing, `payer_code` ~40% missing) were removed.
+4. **Preservation of Glycemic Indicators (HbA1c & Blood Glucose)**: In the original study (*Strack et al., 2014*), HbA1c testing was ordered in only ~18% of encounters. Treating `'None'` as missing data and dropping `A1Cresult` discards critical clinical intelligence. Here, HbA1c and glucose testing are preserved as vital markers of glycemic monitoring and control.
+5. **Data Split Isolation**: Imputers, scalers, encoders, and resampling transformers are fitted strictly inside training folds using `imblearn.pipeline.Pipeline`, guaranteeing zero test data leakage.
 
 ---
 
@@ -38,211 +58,207 @@ Most public healthcare ML implementations suffer from severe data leakage and me
 
 ### 1. 5-Fold Stratified Cross-Validation Benchmark (Training Cohort: 48,992 Patients)
 
-| Model Architecture | 5-Fold ROC-AUC | 5-Fold PR-AUC (Avg Prec) | Brier Score (Calibration) |
-| :--- | :---: | :---: | :---: |
-| **Logistic Regression** (L2 Balanced) | 0.6381 ± 0.0050 | 0.1570 ± 0.0062 | 0.0798 |
-| **Random Forest** (Tuned Balanced) | 0.6443 ± 0.0044 | 0.1642 ± 0.0037 | 0.0795 |
-| **XGBoost** (Gradient Boosted Trees) | 0.6455 ± 0.0045 | 0.1666 ± 0.0052 | 0.0794 |
-| **LightGBM** (Calibrated — **Best Model**) | **0.6458 ± 0.0064** | **0.1693 ± 0.0060** | **0.0794** |
+All models and resampling strategies were evaluated across a rigorous 5-fold stratified cross-validation protocol:
 
-### 2. Held-Out Unseen Test Cohort Evaluation (10,499 Patients)
+| Model Configuration | Model Family | Imbalance Strategy | 5-Fold ROC-AUC | 5-Fold PR-AUC (Avg Precision) | Brier Score (Calibration) | Balanced Accuracy |
+| :--- | :--- | :--- | :---: | :---: | :---: | :---: |
+| **Dummy (Stratified)** | Baseline Dummy | None | 0.4993 ± 0.0022 | 0.0897 ± 0.0003 | 0.1640 | 0.4993 |
+| **Logistic Regression (Weighted)** | Linear Model | Class Weighting | 0.6381 ± 0.0050 | 0.1570 ± 0.0062 | 0.0798 | 0.5003 |
+| **Random Forest (Weighted)** | Bagged Trees | Class Weighting | 0.6450 ± 0.0039 | 0.1648 ± 0.0048 | 0.0795 | 0.5000 |
+| **XGBoost (Weighted)** | Gradient Boosting | Class Weighting | 0.6451 ± 0.0045 | 0.1666 ± 0.0049 | 0.0794 | 0.5000 |
+| **LightGBM (Weighted)** | Gradient Boosting | Class Weighting | **0.6457 ± 0.0059** | **0.1693 ± 0.0060** | **0.0794** | 0.5000 |
+| **LightGBM (Unweighted)** | Gradient Boosting | None | 0.6424 ± 0.0044 | 0.1660 ± 0.0046 | 0.0794 | 0.5008 |
+| **LightGBM (SMOTE)** | Gradient Boosting | SMOTE (imblearn) | 0.6363 ± 0.0033 | 0.1580 ± 0.0044 | 0.0808 | 0.5000 |
+| **Logistic Regression (SMOTE)** | Linear Model | SMOTE (imblearn) | 0.6313 ± 0.0082 | 0.1537 ± 0.0058 | 0.1092 | 0.5289 |
 
-* **Test ROC-AUC**: `0.6336`
-* **Test PR-AUC**: `0.1616` (Base prevalence: 8.98%)
-* **Brier Score**: `0.0796`
+### Key Cross-Validation Insights:
+* **SMOTE vs. Class Weighting**: In high-dimensional tabular EHR data with sparse one-hot encoded categories, SMOTE interpolation (`PR-AUC = 0.1580`) underperformed algorithmic class weighting (`PR-AUC = 0.1693`). Cost-sensitive loss functions directly penalize minority false negatives without synthesizing artificial points in sparse categorical spaces.
+* **Probability Calibration**: Calibrating gradient-boosted trees using Platt scaling (sigmoid) maintained optimal ranking while reducing Brier score loss to **0.0794**, ensuring reliable empirical risk estimates.
 
 ---
 
-## ⚖️ The 91% Accuracy Paradox & Decision Threshold Optimization
+### 2. Held-Out Untouched Test Cohort Results (10,499 Patients)
 
-In imbalanced clinical datasets where the positive outcome prevalence is ~9%, **accuracy is a dangerous and misleading metric**:
+| Model Architecture | Threshold | ROC-AUC | PR-AUC | Sensitivity (Recall) | Specificity | Precision | F1-Score | Brier Score |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Dummy Baseline** | 0.500 | 0.5000 | 0.0898 | 0.00% | 100.0% | 0.00% | 0.000 | 0.0818 |
+| **Logistic Regression** | 0.500 | 0.6331 | 0.1537 | 0.11% | 99.95% | 16.67% | 0.002 | 0.0800 |
+| **Random Forest** | 0.500 | 0.6354 | 0.1543 | 0.00% | 100.0% | 0.00% | 0.000 | 0.0799 |
+| **XGBoost** | 0.500 | 0.6343 | 0.1589 | 0.00% | 100.0% | 0.00% | 0.000 | 0.0797 |
+| **LightGBM (Best Model)** | **0.500** | **0.6335** | **0.1617** | **0.00%** | **100.0%** | **0.00%** | **0.000** | **0.0796** |
+| **LightGBM (Optimal Threshold)** | **0.086** | **0.6335** | **0.1617** | **61.29%** | **57.73%** | **12.57%** | **0.2086** | **0.0796** |
+
+---
+
+## ⚠️ The 91% Accuracy Paradox & Decision Threshold Selection
+
+In imbalanced clinical outcomes where positive prevalence is ~9%, **accuracy is a dangerous and misleading metric**:
 
 * **At Standard Default Threshold ($0.500$)**:
-  * Accuracy is **91.02%** — but Sensitivity (Recall) is **0.0%**! The model predicts negative for every patient, missing **100% of readmissions** (0 True Positives, 943 False Negatives).
-* **At Optimal Clinical Threshold ($0.085$, Youden's J Statistic)**:
-  * Accuracy is **57.41%**, but Sensitivity (Recall) rises to **62.35%**, successfully detecting nearly two-thirds of all readmitted patients (588 True Positives detected) for targeted clinical intervention!
+  * Accuracy is **91.02%** — but Sensitivity (Recall) is **0.00%**! The model predicts negative for every patient, missing **100% of readmissions** (0 True Positives, 943 False Negatives).
+* **At Optimal Clinical Threshold ($0.086$, Youden's J Statistic on Validation Cohort)**:
+  * Sensitivity (Recall) rises to **61.29%**, successfully capturing over 61% of all readmissions (578 True Positives detected) for targeted clinical intervention!
 
 | Decision Threshold Strategy | Accuracy | Sensitivity (Recall) | Specificity | Precision | F1 Score | True Positives | False Negatives |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | **Default Threshold ($0.500$)** | 91.02% | **0.00%** | 100.0% | 0.00% | 0.000 | 0 | 943 |
-| **Optimal Clinical Threshold ($0.085$)** | 57.41% | **62.35%** | 56.92% | 12.50% | **0.208** | **588** | 355 |
-
-<p align="center">
-  <img src="output_images/roc_and_pr_curves_comparison.png" width="85%" alt="ROC and PR Curves Comparison"/>
-</p>
+| **Optimal Clinical Threshold ($0.086$)** | 58.05% | **61.29%** | 57.73% | 12.57% | **0.2086** | **578** | 365 |
 
 ---
 
-## 🧠 Explainability & Clinical Decision Support (SHAP)
+## 🔍 Explainable AI (SHAP) & Clinical Transparency
 
-To foster clinical adoption, the model integrates SHAP (SHapley Additive exPlanations) to identify global and patient-specific risk drivers:
+Model predictions are interpreted using SHapley Additive exPlanations (SHAP) TreeExplainer:
 
-<p align="center">
-  <img src="output_images/shap_feature_importance.png" width="75%" alt="SHAP Feature Importance"/>
-</p>
-
-### Key Clinical Drivers Identified:
+### Key Clinical Risk Drivers:
 1. **Prior Acute Inpatient Utilization (`number_inpatient`)**: Strongest monotonic driver of readmission. Patients with $\ge 1$ previous admission exhibit more than double the readmission rate.
 2. **Discharge Disposition**: Patients discharged to skilled nursing or home health care demonstrate higher readmission vulnerability due to frailty.
 3. **Glycemic Volatility & Monitoring (`A1Cresult`, `insulin`)**: Insulin dosage adjustments and elevated HbA1c ($>8\%$) reflect unstable metabolic management.
 4. **Healthcare Intensity & Polypharmacy**: Higher daily medication counts (`meds_per_day`) combined with prolonged stays indicate multimorbid disease burden.
 
-### Actionable Care Management Protocols:
-
-<p align="center">
-  <img src="output_images/clinical_risk_stratification.png" width="75%" alt="Clinical Risk Stratification"/>
-</p>
-
-| Risk Tier | Probability Range | Actionable Transition-of-Care Protocol |
-| :--- | :---: | :--- |
-| **Low Risk** | $< 6.35\%$ | Routine discharge instructions; standard primary care follow-up within 14–30 days; electronic portal medication reconciliation. |
-| **Moderate Risk** | $6.35\% - 11.44\%$ | Targeted diabetes self-management education; scheduled outpatient clinic appointment within 7 days; 48-hour post-discharge telephone nurse check-in. |
-| **High Risk** | $> 11.44\%$ | **Intensive Care Coordination:** Dedicated nurse navigator assigned; bedside medication delivery; mandatory clinical visit within 72 hours; clinical pharmacist medication reconciliation. |
+> [!NOTE]
+> SHAP and feature importance metrics reflect statistical associations and model decision patterns within observational data. They do **not** represent causal clinical effects.
 
 ---
 
-## 📁 Repository Structure
+## 💾 SQL Healthcare Analytics Engine
+
+The analytical SQLite database (`data/processed/readmission_analytics.db`) stores cleaned encounter cohorts, scored test predictions, and evaluation metrics. Eight clinical business queries answer key operational questions:
+
+1. **Prevalence & Cohort Base**: Computes 8.98% baseline 30-day readmission prevalence across 69,990 clean encounters.
+2. **Readmission by Age Bracket**: Highlights rising readmission rates in patients aged 70–90 with small sample size flags for pediatric categories.
+3. **Readmission by Length of Stay**: Demonstrates that patients with stays $\ge 9$ days experience readmission rates of 11.8% vs 7.4% for 1–2 day stays.
+4. **Readmission by Prior Utilization**: Quantifies the acute risk increase from 7.5% (0 prior admissions) to 21.6% (3+ prior admissions).
+5. **Post-Acute Discharge Pathways**: Identifies high risk among patients discharged to Home Health/SNF (12.4%) or Left Against Medical Advice (12.8%).
+6. **Risk Tier Stratification**: Audits observed vs predicted readmission rates across Low, Moderate, and High tiers.
+7. **Error Analysis (FP vs FN)**: Characterizes False Positives (high polypharmacy and stay duration, but avoided readmission) vs False Negatives.
+8. **Subgroup Performance**: Measures sensitivity and precision across vulnerable clinical cohorts (Elderly 65+, Prior Inpatient History, Insulin Users).
+
+---
+
+## 🎯 Risk Stratification & Care Team Capacity Simulator
+
+Patients are stratified into actionable care coordination cohorts:
+
+| Risk Tier | Probability Range | Observed Rate | Actionable Transition-of-Care Protocol |
+| :--- | :---: | :---: | :--- |
+| **Low Risk** | $< 6.45\%$ | ~4.8% | Routine discharge instructions; standard primary care follow-up within 14–30 days; patient portal educational materials. |
+| **Moderate Risk** | $6.45\% - 11.61\%$ | ~8.7% | Targeted diabetes self-management education; scheduled outpatient clinic appointment within 7 days; 48-hour post-discharge telephone nurse check-in. |
+| **High Risk** | $> 11.61\%$ | ~17.5% | **Intensive Care Coordination:** Dedicated nurse navigator assigned; bedside medication delivery; mandatory clinical visit within 72 hours; clinical pharmacist medication reconciliation. |
+
+The simulator projects clinical caseload against Full-Time Equivalent (FTE) nurse staffing constraints to prevent care coordinator burnout.
+
+---
+
+## 📂 Project Architecture
 
 ```
 patient-readmission-risk-modeling/
 ├── data/
-│   ├── diabetic_data.csv                       # Raw 10-year EHR dataset (101,766 encounters)
-│   └── interim/                                # Cleaned, patient-deduplicated Parquet splits
-│       ├── df_train.parquet
-│       ├── df_val.parquet
-│       └── df_test.parquet
+│   ├── raw/
+│   │   └── diabetic_data.csv          # 10-year raw EHR dataset (101,766 encounters)
+│   ├── interim/                       # Fast parquet cohort splits
+│   └── processed/
+│       ├── readmission_analytics.db   # SQLite analytical clinical database (9.1 MB)
+│       └── df_test_predictions.parquet# Test set with probabilities & risk tiers
 ├── model/
-│   ├── best_model.pkl                          # Serialized Calibrated LightGBM Pipeline
-│   └── model_metadata.json                     # Thresholds, metrics, and risk tier configs
+│   ├── best_model.pkl                 # Calibrated LightGBM Production Pipeline
+│   └── model_metadata.json            # Thresholds, clinical tiers, test metrics
 ├── notebooks/
-│   ├── 01_eda_and_clinical_analysis.ipynb      # Clinical cohort profiling, exclusions & odds ratios
-│   ├── 02_model_benchmarking.ipynb             # 5-fold CV, calibration curves & threshold tuning
-│   └── 03_explainability_and_clinical_utility.ipynb # SHAP beeswarm plots & case studies
+│   ├── 01_eda_and_clinical_analysis.ipynb
+│   ├── 02_model_benchmarking.ipynb
+│   └── 03_explainability_and_clinical_utility.ipynb
 ├── src/
 │   ├── __init__.py
-│   ├── config.py                               # Paths, feature groups, clinical exclusion IDs
-│   ├── data_loader.py                          # Cohort filtering & patient-level splitting
-│   ├── features.py                             # Scikit-learn ClinicalFeatureEngineer transformer
-│   ├── pipeline.py                             # Pipeline construction & calibration factory
-│   ├── train.py                                # CLI model training and evaluation script
-│   ├── evaluate.py                             # ROC, PR, Brier, Youden's J & plotting utilities
-│   ├── explain.py                              # SHAP analysis and risk stratification visuals
-│   └── predict.py                              # Production FastAPI inference server
-├── tests/
-│   ├── test_features.py                        # ICD-9 mapping & feature transformation tests
-│   ├── test_pipeline.py                        # Pipeline fit/predict & probability boundary tests
-│   └── test_api.py                             # FastAPI endpoint integration tests
-├── output_images/                              # High-resolution benchmark figures
-├── Dockerfile                                  # Multi-stage production container build
-├── pyproject.toml                              # Clean dependency specification managed by uv
-└── uv.lock
+│   ├── config.py                      # Paths, clinical exclusion codes, feature lists
+│   ├── data/
+│   │   ├── loader.py                  # Stratified & patient-grouped splitting
+│   │   └── target.py                  # Target creation & CMS exclusion filtering
+│   ├── features/
+│   │   └── engineering.py             # Vectorized ClinicalFeatureEngineer transformer
+│   ├── models/
+│   │   ├── baseline.py                # DummyClassifier benchmarks
+│   │   ├── smote_pipeline.py          # imblearn SMOTE & Class Weighting pipelines
+│   │   ├── hyperparameter_tuning.py   # RandomizedSearchCV for PR-AUC
+│   │   └── train_models.py            # 5-fold CV & held-out test evaluation
+│   ├── evaluation/
+│   │   ├── metrics.py                 # Discrimination, calibration & Youden's J
+│   │   └── plots.py                   # ROC, PR, calibration & confusion matrix
+│   ├── explainability/
+│   │   └── shap_explainer.py          # SHAP global beeswarm & local waterfalls
+│   ├── database/
+│   │   ├── init_db.py                 # SQLite database initializer
+│   │   └── queries.py                 # 8 business SQL queries
+│   └── risk_stratification/
+│       └── stratifier.py              # Risk tiers & care team workload simulator
+├── tests/                             # 30 passing pytest unit & integration tests
+│   ├── test_target.py
+│   ├── test_features.py
+│   ├── test_smote_isolation.py
+│   ├── test_evaluation_metrics.py
+│   ├── test_risk_stratification.py
+│   ├── test_database.py
+│   ├── test_pipeline.py
+│   └── test_api.py
+├── reports/
+│   ├── eda_clinical_summary.md        # Complete EDA statistical audit
+│   ├── model_performance_benchmark.md # Cross-validation & test evaluation report
+│   ├── sql_analytics_insights.md      # SQL queries & tabular outputs
+│   └── figures/                       # High-resolution clinical figures (PNG)
+├── app.py                             # Interactive Streamlit Multi-Page Dashboard
+├── run_pipeline.py                    # End-to-end automated orchestration pipeline
+├── run_eda.py                         # EDA profiling script
+├── pyproject.toml                     # Dependency definitions (uv-managed)
+└── README.md
 ```
 
 ---
 
-## 🚀 Quickstart & Usage
+## 🚀 Reproduction & Execution Guide
 
-### 1. Installation
-Clone the repository and install dependencies using [Astral `uv`](https://docs.astral.sh/uv/) (or standard `pip`):
+### 1. Prerequisites & Environment Setup
+Using `uv` (recommended) or standard Python 3.12+:
 
 ```bash
-git clone https://github.com/yadaakshay/patient-readmission-risk-modeling.git
+# Clone the repository
+git clone https://github.com/your-username/patient-readmission-risk-modeling.git
 cd patient-readmission-risk-modeling
 
 # Create virtual environment and install dependencies
-uv sync
+uv venv
+uv pip install -e .
+uv pip install streamlit duckdb tabulate
 ```
 
-### 2. Run Automated Test Suite
-Ensure all 8 clinical transformation and API unit tests pass:
+### 2. Run the Full Pipeline
+Executes cohort filtering, 5-fold CV, hyperparameter tuning, test set evaluation, SHAP explainability, and SQLite database population:
 
 ```bash
-uv run pytest tests/
+python run_pipeline.py
 ```
 
-### 3. Model Training CLI
-Train candidate models, execute 5-fold cross validation, calibrate probabilities, and persist the production pipeline:
+### 3. Run Unit and Integration Tests
+Executes all 30 tests covering target creation, feature engineering, SMOTE fold isolation, metric computations, risk stratification, and database queries:
 
 ```bash
-# Train full cross-validation benchmark
-uv run python src/train.py --model all
-
-# Or train LightGBM with probability calibration
-uv run python src/train.py --model lightgbm --cv 5
+pytest -v
 ```
 
-### 4. Run Production FastAPI Service
-Launch the clinical decision support API on port 9696:
-
+### 4. Launch Interactive Streamlit Dashboard
 ```bash
-uv run python src/predict.py
+streamlit run app.py
 ```
 
-* Swagger UI Documentation: `http://localhost:9696/docs`
-* Health Check: `http://localhost:9696/health`
-
-### 5. API Request & Response Example
-
-**POST** `/predict`
-```json
-{
-  "time_in_hospital": 5,
-  "num_lab_procedures": 52,
-  "num_procedures": 1,
-  "num_medications": 19,
-  "number_outpatient": 0,
-  "number_emergency": 1,
-  "number_inpatient": 2,
-  "number_diagnoses": 9,
-  "race": "Caucasian",
-  "gender": "Female",
-  "age": "[70-80)",
-  "admission_type_id": 1,
-  "discharge_disposition_id": 3,
-  "admission_source_id": 7,
-  "diag_1": "428",
-  "diag_2": "250.02",
-  "diag_3": "585",
-  "max_glu_serum": "None",
-  "A1Cresult": ">8",
-  "insulin": "Up",
-  "change": "Ch",
-  "diabetesMed": "Yes"
-}
+### 5. Launch FastAPI Clinical Prediction Server
+```bash
+uvicorn src.predict:app --host 0.0.0.0 --port 9696 --reload
 ```
-
-**Response**:
-```json
-{
-  "readmission_probability": 0.2285,
-  "readmitted_flag": true,
-  "risk_tier": "High",
-  "decision_threshold": 0.0847,
-  "key_risk_drivers": [
-    "Prior inpatient hospitalization history (2 previous admissions)",
-    "Poor glycemic control: Elevated HbA1c > 8.0%",
-    "Polypharmacy complexity (19 active inpatient medications)",
-    "Active insulin dose titration / instability during encounter",
-    "Primary cardiovascular / circulatory acute diagnosis",
-    "Post-discharge transitional care need: Discharged with Home Health Care or SNF"
-  ],
-  "clinical_action_plan": "URGENT: High 30-day readmission risk. Enroll patient in intensive transition-of-care program. Schedule clinical follow-up within 72 hours of discharge, assign a nurse navigator, and conduct full clinical pharmacist medication reconciliation."
-}
-```
+Interactive API documentation will be available at `http://localhost:9696/docs`.
 
 ---
 
-## 🐳 Docker Deployment
+## ⚖️ Responsible AI & Ethical Disclaimers
 
-Build and run the containerized service:
-
-```bash
-docker build -t patient-readmission-service:2.0 .
-docker run -p 9696:9696 patient-readmission-service:2.0
-```
-
----
-
-## 📜 References & Acknowledgements
-* Strack, B., DeShazo, J. P., Gennings, C., Olmo, J. L., Ventura, S., Cios, K. J., & Clore, J. N. (2014). *Impact of HbA1c Measurement on Hospital Readmission Rates: Analysis of 70,000 Clinical Database Records*. BioMed Research International, 2014.
-* Centers for Medicare & Medicaid Services (CMS). *Hospital Readmissions Reduction Program (HRRP)*.
+1. **Non-Diagnostic Research Prototype**: This software is an algorithmic research demonstration and decision-support tool. It does not provide medical diagnoses, treatment prescriptions, or definitive clinical forecasts.
+2. **Physician Autonomy**: All model risk flags and hypothetical transition-of-care recommendations must be evaluated and confirmed by a licensed medical practitioner.
+3. **Health Equity & Subgroup Performance**: Algorithmic models trained on historical EHR data can inherit systemic clinical disparities. While demographic features (`race`, `gender`) were balanced, model performance across subgroups must be regularly audited to ensure equitable care delivery.
